@@ -242,6 +242,8 @@ memory.close()
 
 The graph extends naturally across multi-step workflows: intermediate `Result` nodes can be passed as inputs to downstream functions, and the optimizer will attribute feedback to the right step. See `examples/memory_optimization.py` for a full multi-agent example, and the [tutorial](docs/tutorial.md) for details on memory backends, procedural parameters, and exposing memory as agent tools.
 
+For worked examples of the full learning loop on code-generation benchmarks, see `examples/scipy_backprop_demo.py` and `examples/pandas_backprop_demo.py`. Each runs a three-step ablation on DS-1000 problems — direct test with empty memory, training on 8 examples with backpropagation, then re-testing with the trained memory — and shows how feedback from execution errors (including test assertions with `Expected` vs `Got` diffs) flows through `optimizer.backward` to produce memory bullets that fix the same error class at test time.
+
 
 ## Tutorial
 

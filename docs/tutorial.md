@@ -466,6 +466,13 @@ memory.close()
 
 See `examples/memory_optimization.py` for a full example of a memory optimization workflow on a multi-agent graph.
 
+For worked end-to-end learning loops on DS-1000 code-generation problems, see:
+
+- `examples/scipy_backprop_demo.py` — `scipy.optimize.minimize` contract (`TypeError` → fixed by `.x` attribute memory bullet)
+- `examples/pandas_backprop_demo.py` — MultiIndex filter semantics (`AssertionError` with `Expected` vs `Got` DataFrame diff → fixed after training)
+
+Each demo runs the same three-step ablation: direct test with empty memory, train on 8 problems in parallel (gradients accumulated via `optimizer.backward`), then re-test with the trained memory. The shared `examples/ds1000_utils.py` wraps the DS-1000 executor so execution failures (including test assertion diffs) flow into the optimizer feedback as rich `Expected`/`Got` context.
+
 ### Memory Backends
 
 A memory backend manages the storage, retrieval, and consolidation of parameters. The `MemoryBackend` base class handles all graph wiring — subclass it and implement the storage methods to build your own. The library ships with two implementations: `JSONMemoryBackend` (file-based, uses TinyDB) and `AgentCoreMemoryBackend` (backed by Amazon Bedrock AgentCore memory).

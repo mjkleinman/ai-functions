@@ -4,6 +4,8 @@ version = "0.1.0"
 dependencies = [
     "pandas>=3.0.0",
     "plotly>=6.5.2",
+    "scipy>=1.14.0",
+    "scikit-learn>=1.5.0",
     "sqlglot>=28.3.0",
     "strands-agents-tools>=0.2.20",
     "strands-ai-functions",
