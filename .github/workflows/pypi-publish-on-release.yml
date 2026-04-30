@@ -38,11 +38,11 @@ jobs:
       - name: Validate version
         run: |
           version=$(hatch version)
-          if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "Valid version format"
+          if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+              echo "Valid version format: $version"
               exit 0
           else
-              echo "Invalid version format"
+              echo "Invalid version format: $version"
               exit 1
           fi
       - name: Build
