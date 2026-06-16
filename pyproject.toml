@@ -1,25 +1,22 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "strands-ai-functions"
-dynamic = ["version"]
+version = "2.0.0.dev0"
 description = "AI Function decorator for enhancing functions with AI capabilities"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "AWS", email = "opensource@amazon.com"},
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -29,30 +26,19 @@ classifiers = [
 dependencies = [
     "strands-agents>=1.16.0",
     "pydantic>=2.4.0,<3.0.0",
-    "smolagents>=1.24.0",
     "tstr>=0.4.0.post1",
-    "rank-bm25>=0.2.2",
-    "tinydb>=4.8.2",
-    "bedrock-agentcore>=1.6.0",
+]
+
+[project.optional-dependencies]
+network = [
+    "websockets>=12.0",
+    "cloudpickle>=3.0.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/strands-labs/ai-functions"
-Documentation = "https://github.com/strands-labs/ai-functions#readme"
 Repository = "https://github.com/strands-labs/ai-functions.git"
 Issues = "https://github.com/strands-labs/ai-functions/issues"
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21.0",
-    "hypothesis>=6.0",
-    "mypy>=1.0",
-    "ruff>=0.1.0",
-]
-
-[tool.hatch.version]
-source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_functions"]
@@ -63,8 +49,9 @@ dependencies = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0",
     "hypothesis>=6.0",
-    "mypy>=1.0",
     "ruff>=0.1.0",
+    "websockets>=12.0",
+    "cloudpickle>=3.0.0",
 ]
 
 [tool.hatch.envs.default.scripts]
@@ -72,12 +59,14 @@ test = "pytest {args:tests}"
 test-cov = "pytest --cov=ai_functions {args:tests}"
 lint = "ruff check src tests"
 format = "ruff format src tests"
-typecheck = "mypy src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore:websockets\\.legacy is deprecated:DeprecationWarning:websockets.legacy",
+]
 
 [tool.ruff]
 line-length = 120
@@ -85,31 +74,21 @@ include = ["examples/**/*.py", "src/**/*.py", "tests/**/*.py"]
 
 [tool.ruff.lint]
 select = ["B", "D", "E", "F", "I", "UP", "W"]
+ignore = ["D107"]
 
 [tool.ruff.lint.per-file-ignores]
-"!src/**/*.py" = ["D"]
-# @ai_function docstrings serve as LLM prompts — exempt from docstring formatting rules
-"src/ai_functions/memory/json_backend.py" = ["D205", "D415"]
-"src/ai_functions/optimizer/textgrad.py" = ["D205"]
+"tests/**/*.py" = ["D"]
+"examples/**/*.py" = ["D"]
+"src/ai_functions/network/client.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/endpoint.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/channel.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/wire_methods.py" = ["D101"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.mypy]
-python_version = "3.12"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-follow_untyped_imports = true
-ignore_missing_imports = false
 
 [tool.uv.workspace]
 members = ["examples"]

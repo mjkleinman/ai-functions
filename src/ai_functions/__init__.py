@@ -1,28 +1,35 @@
-"""AI Functions - Enhanced AI Function interface.
+"""AI-enhanced functions and thread orchestration."""
 
-This module provides the @ai_function decorator for transforming Python
-functions into AI-powered functions using the Strands Agents SDK.
-
-Usage:
-    from ai_functions import ai_function
-    from ai_functions.types import AIFunctionConfig, CodeExecutionMode, ValidationError
-
-    @ai_function
-    def summarize(text: str) -> str:
-        '''Summarize: {text}'''
-"""
-
-from .core import AsyncAIFunction, SyncAIFunction
-from .decorator import ai_function
-from .types import AIFunctionConfig, CodeExecutionMode, ParameterView, PostConditionResult, Result
+from .ai_thread import (
+    AIFunction,
+    AIThread,
+    DefaultSummarizationStrategy,
+    SummarizationFailedError,
+    SummarizationStrategy,
+    ai_function,
+)
+from .handle import ThreadHandle
+from .protocols import Coordinator, Spawnable, Thread
+from .runtime import (
+    InMemoryCoordinator,
+    LocalWorker,
+    WorkerAdapter,
+)
+from .utils import run_blocking
 
 __all__ = [
-    "AsyncAIFunction",
-    "SyncAIFunction",
-    "AIFunctionConfig",
-    "CodeExecutionMode",
-    "PostConditionResult",
     "ai_function",
-    "Result",
-    "ParameterView",
+    "AIFunction",
+    "AIThread",
+    "Coordinator",
+    "DefaultSummarizationStrategy",
+    "InMemoryCoordinator",
+    "LocalWorker",
+    "run_blocking",
+    "Spawnable",
+    "SummarizationFailedError",
+    "SummarizationStrategy",
+    "Thread",
+    "ThreadHandle",
+    "WorkerAdapter",
 ]
