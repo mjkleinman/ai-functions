@@ -10,7 +10,7 @@ Through AI Functions, developers can construct agentic workflows and agent graph
 
 ## Getting Started
 
-While the minimum supported version is Python >=3.10, we recommend using Python >=3.14 for native [t-string](https://peps.python.org/pep-0750/) template literal support.
+While the minimum supported version is Python >=3.11, we recommend using Python >=3.14 for native [t-string](https://peps.python.org/pep-0750/) template literal support.
 We also recommend using `uv` (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/)) to run the provided examples.
 
 To install the Strands AI Functions extension, run:
