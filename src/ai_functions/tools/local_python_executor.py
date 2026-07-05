@@ -1,75 +1,101 @@
 """Local Python executor tool for AI Functions.
 
-This module provides a tool for executing Python code locally using
-smolagents' LocalPythonExecutor for safer AST-based execution.
+Executes agent-generated Python with smolagents' ``LocalPythonExecutor`` — an
+AST-based interpreter that is far safer than raw ``exec`` (no arbitrary imports,
+no attribute escapes; only an allowlist of modules). Used to run ``Procedural``
+memory parameters: their code is injected into the execution namespace, and the
+agent calls helpers and returns a typed result via the ``final_answer`` callback.
+
+Importing this module is cheap; constructing :class:`LocalPythonExecutorTool`
+raises ``ImportError`` if ``smolagents`` is unavailable.
+
+The model returns its answer by calling ``final_answer(...)`` inside executed
+code. The tool captures that, writes it into
+``tool_context.invocation_state["request_state"]["python_executor_result"]``,
+and requests the event loop to stop. The runtime then reads it from
+``AgentResult.state`` (see ``AIThread._extract_result``).
 """
 
+from __future__ import annotations
+
+import ast
+import inspect
 import io
 import os
 import textwrap
 from typing import Any
 
 from pydantic import BaseModel
-from rich import box
-from rich.console import Console
-from rich.panel import Panel
-from rich.syntax import Syntax
-from smolagents.local_python_executor import LocalPythonExecutor
 from strands import ToolContext, tool
 
-from ..utils._type import generate_signature_from_model
-
+# Modules the sandboxed interpreter may import. Pure-computation stdlib only —
+# no os, sys, subprocess, socket, etc.
 SAFE_BUILTINS = [
-    "math",
-    "cmath",
-    "decimal",
-    "fractions",
-    "random",
-    "statistics",
-    "numbers",
-    "collections",
-    "heapq",
-    "bisect",
-    "array",
-    "queue",
-    "copy",
-    "pprint",
-    "enum",
-    "dataclasses",
-    "graphlib",
-    "string",
-    "re",
-    "textwrap",
-    "unicodedata",
-    "difflib",
-    "stringprep",
-    "datetime",
-    "calendar",
-    "zoneinfo",
-    "itertools",
-    "functools",
-    "operator",
-    "typing",
-    "types",
-    "abc",
-    "contextlib",
-    "json",
-    "base64",
-    "binascii",
-    "html",
-    "hashlib",
-]
+    "math", "cmath", "decimal", "fractions", "random", "statistics", "numbers",
+    "collections", "heapq", "bisect", "array", "queue", "copy", "pprint", "enum",
+    "dataclasses", "graphlib", "string", "re", "textwrap", "unicodedata",
+    "difflib", "stringprep", "datetime", "calendar", "zoneinfo", "itertools",
+    "functools", "operator", "typing", "types", "abc", "contextlib", "json",
+    "base64", "binascii", "html", "hashlib",
+]  # fmt: skip
+
+
+def generate_signature_from_model(model: type[BaseModel], func_name: str = "final_answer") -> str:
+    """Build a ``final_answer(...)`` signature string from a pydantic model's fields."""
+    params: list[inspect.Parameter] = []
+    for field_name, field_info in model.model_fields.items():
+        if field_info.is_required():
+            params.append(
+                inspect.Parameter(field_name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=field_info.annotation)
+            )
+        else:
+            params.append(
+                inspect.Parameter(
+                    field_name,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=field_info.default,
+                    annotation=field_info.annotation,
+                )
+            )
+    return f"{func_name}{inspect.Signature(params)}"
+
+
+def procedural_signatures(code: str) -> list[str]:
+    """Advertise the callable helpers in ``code``, one signature block each.
+
+    For every top-level ``def`` / ``async def`` (skipping ``_``-prefixed
+    internal helpers), returns the ``def`` line — with its parameter list and
+    return annotation — followed by the function's docstring if present, or a
+    ``...`` body otherwise. The docstring is included because it is how the
+    agent learns *when* to call a helper, not just its name and parameters.
+
+    Only top-level definitions are advertised: those are the names actually
+    callable in the sandbox namespace after the code runs. Returns an empty
+    list if ``code`` cannot be parsed, so the caller cleanly omits the
+    advertisement rather than emitting a malformed blob.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    blocks: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name.startswith("_"):
+            continue
+        prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+        sig = f"{prefix}{node.name}({ast.unparse(node.args)})"
+        if node.returns is not None:
+            sig += f" -> {ast.unparse(node.returns)}"
+        docstring = ast.get_docstring(node)
+        body = textwrap.indent(f'"""{docstring}"""', "    ") if docstring else "    ..."
+        blocks.append(f"{sig}:\n{body}")
+    return blocks
 
 
 class PythonExecuteResult(BaseModel):
-    """Result from local Python code execution.
-
-    Attributes:
-        success: Whether the execution completed without errors
-        final_answer: Dict of kwargs passed to final_answer() callback, or None
-        stdout: Captured standard output
-        error: Error message if execution failed, or None
-    """
+    """Result of one ``python_executor`` call."""
 
     success: bool
     final_answer: dict[str, Any] | None = None
@@ -77,8 +103,8 @@ class PythonExecuteResult(BaseModel):
     error: str | None = None
 
     def to_markdown(self) -> str:
-        """Convert execution result to markdown format for display."""
-        parts = []
+        """Render the result as markdown for the agent to read."""
+        parts: list[str] = []
         if self.error:
             parts.append("## ERROR")
             parts.append(self.error)
@@ -96,64 +122,74 @@ class PythonExecuteResult(BaseModel):
 
 
 def _display_code(content: str, title: str | None = None, line_numbers: bool = True) -> None:
-    """Display python code with syntax highlighting if STRANDS_TOOL_CONSOLE_MODE is enabled.
+    """Pretty-print code/results when ``STRANDS_TOOL_CONSOLE_MODE=enabled``."""
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.syntax import Syntax
 
-    If STRANDS_TOOL_CONSOLE_MODE environment variable is set to "enabled",
-    displays python code to stdout with syntax highlighting.
-    """
     console = Console(file=io.StringIO()) if os.getenv("STRANDS_TOOL_CONSOLE_MODE") != "enabled" else Console()
     syntax = Syntax(content, lexer="python", theme="monokai", line_numbers=line_numbers)
-    panel = Panel(syntax, title=title, border_style="blue", box=box.DOUBLE, expand=False, padding=(0, 0))
-    console.print(panel)
+    console.print(Panel(syntax, title=title, border_style="blue", box=box.DOUBLE, expand=False, padding=(0, 0)))
 
 
 class LocalPythonExecutorTool:
-    """Strands tool that executes Python code using smolagents' LocalPythonExecutor.
+    """Strands tool wrapping smolagents' AST-based ``LocalPythonExecutor``.
 
-    This tool provides a safer interface for executing Python code by using smolagents' AST-based interpreter.
-    https://huggingface.co/docs/smolagents/en/tutorials/secure_code_execution#our-local-python-executor
+    Args:
+        output_type: Pydantic model the ``final_answer`` callback constructs.
+        initial_state: Variables injected into the execution namespace (the
+            cycle's bound arguments, including any ``Procedural`` code strings).
+        additional_authorized_imports: Extra modules allowed beyond ``SAFE_BUILTINS``.
+        executor_kwargs: Extra kwargs forwarded to ``LocalPythonExecutor``.
+
+    Raises:
+        ImportError: ``smolagents`` is not installed.
     """
 
     def __init__(
         self,
         output_type: type[BaseModel],
         initial_state: dict[str, Any] | None = None,
+        initial_code: list[str] | None = None,
         additional_authorized_imports: list[str] | None = None,
         executor_kwargs: dict[str, Any] | None = None,
-    ):
-        """Initialize the local Python executor tool.
+    ) -> None:
+        try:
+            from smolagents.local_python_executor import LocalPythonExecutor
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise ImportError(
+                "LocalPythonExecutorTool requires the 'smolagents' package. "
+                "Install it with: pip install smolagents"
+            ) from exc
 
-        Args:
-            output_type: The expected output type for final_answer
-            initial_state: Variables to inject into the execution namespace
-            additional_authorized_imports: List of modules allowed to import.
-            executor_kwargs: Additional keyword arguments passed to LocalPythonExecutor.
-        """
         assert issubclass(output_type, BaseModel)
         self._output_type = output_type
         self._final_answer: dict[str, Any] | None = None
 
-        # Create the smolagents executor with final_answer as a static tool.
-        # final_answer is the callback used to capture the final answer from execution env.
         self._code_executor = LocalPythonExecutor(
             additional_authorized_imports=SAFE_BUILTINS + list(additional_authorized_imports or []),
-            additional_functions={"final_answer": self._set_execution_result, "repr": repr},
+            additional_functions={"final_answer": self._set_execution_result},
             **(executor_kwargs or {}),
         )
-
-        # Initialize tools (required for additional_functions to be callable)
         self._code_executor.send_tools({})
-
-        # Inject initial state
         if initial_state:
             self._code_executor.send_variables(initial_state)
+        # Execute procedural code blocks so their functions/classes are DEFINED
+        # in the persistent namespace (the sandbox forbids exec(), so injecting
+        # the source as a string variable would not make the helpers callable).
+        # Surface setup failures: malformed/erroring recalled helper code means
+        # the helpers silently would not exist, leaving the agent no diagnostic.
+        for code in initial_code or []:
+            if code and code.strip():
+                setup = self._execute_code(code)
+                if not setup.success:
+                    raise ValueError(f"Failed to load procedural code into the executor namespace:\n{setup.error}")
 
-        # Update tool description with the correct final_answer signature
         self.python_executor.tool_spec["description"] = self._build_tool_description()
 
     def _build_tool_description(self) -> str:
-        """Build the tool description with the correct final_answer signature."""
-        signature = self._get_final_answer_signature()
+        signature = generate_signature_from_model(self._output_type)
         return textwrap.dedent(f"""\
             Execute Python code in a persistent environment.
 
@@ -173,82 +209,58 @@ class LocalPythonExecutorTool:
             If final_answer is not called, no result is returned.
             """)
 
-    def _get_final_answer_signature(self) -> str:
-        """Generate the signature for final_answer based on output type."""
-        return generate_signature_from_model(self._output_type)
-
     def _set_execution_result(self, *args: Any, **kwargs: Any) -> None:
-        """Called by executed code to set the final result."""
+        """``final_answer`` callback invoked from inside executed code."""
         is_simple_wrapper = len(self._output_type.model_fields) == 1 and "answer" in self._output_type.model_fields
-        # Allow calling final_answer(output) without kwargs if the output model is a simple wrapper
         if len(args) == 1 and len(kwargs) == 0 and is_simple_wrapper:
             kwargs["answer"] = args[0]
             args = ()
-        # Raise an exception if the agent passed positional arguments
         if args:
             raise ValueError(
-                f"final_answer only accepts keyword arguments "
-                f"with the following signature: {self._get_final_answer_signature()}"
+                f"final_answer only accepts keyword arguments with the signature: "
+                f"{generate_signature_from_model(self._output_type)}"
             )
         self._final_answer = kwargs
 
     def _execute_code(self, code: str) -> PythonExecuteResult:
-        """Execute Python code using smolagents' LocalPythonExecutor.
-
-        Args:
-            code: Python code to execute
-
-        Returns:
-            PythonExecuteResult with keys:
-                - success: bool indicating if execution completed without error
-                - final_answer: Dict from final_answer callback if called, else None
-                - stdout: str of captured print output
-                - error: str error message if execution failed, else None
-        """
+        """Run ``code`` in the sandbox, capturing stdout / final_answer / errors."""
         try:
             result = self._code_executor(code)
-
-            return PythonExecuteResult(
-                success=True,
-                final_answer=self._final_answer,
-                stdout=result.logs,
-            )
-        except Exception as e:
-            return PythonExecuteResult(
-                success=False,
-                final_answer=None,
-                error=str(e),
-            )
+            return PythonExecuteResult(success=True, final_answer=self._final_answer, stdout=result.logs)
+        except Exception as e:  # noqa: BLE001 - report any execution error to the agent
+            return PythonExecuteResult(success=False, final_answer=None, error=str(e))
 
     @tool(context=True)
     def python_executor(self, code: str, tool_context: ToolContext) -> str:
-        """Execute Python code in the local process.
+        """Execute Python code in the local sandboxed environment.
 
         Args:
-            code: Python code to execute
-            tool_context: Strands tool context for state management
+            code: Python code to execute.
+            tool_context: Strands-provided context for invocation state.
 
         Returns:
-            String representation of execution result
+            A markdown rendering of stdout / final answer.
 
         Raises:
-            ValueError: If final_answer validation fails
-            RuntimeError: If code execution fails
+            ValueError: ``final_answer`` was called with an output the model cannot construct.
+            RuntimeError: The code raised during execution.
         """
         _display_code(code, title="Python Executor Tool")
-
-        # Reset result before execution
         self._final_answer = None
         result = self._execute_code(code)
         result_md = result.to_markdown()
         _display_code(result_md, title="Python Executor Result")
 
-        # If final_answer was called, store the result in invocation_state and stop the agent
-        if result.final_answer:
+        # Distinguish "final_answer not called" (None) from "called but with an
+        # empty/invalid payload" ({}). The latter must still attempt construction
+        # so a missing required field surfaces as an error to the model, rather
+        # than being silently dropped as if no answer were produced.
+        if result.final_answer is not None:
             try:
-                tool_context.invocation_state["python_executor_result"] = self._output_type(**result.final_answer)
-                tool_context.invocation_state["request_state"]["stop_event_loop"] = True
-            except Exception as e:
+                request_state = tool_context.invocation_state["request_state"]
+                request_state["python_executor_result"] = self._output_type(**result.final_answer)
+                request_state["stop_event_loop"] = True
+            except Exception as e:  # noqa: BLE001 - surface construction failure to the agent
                 raise ValueError(f"Failed to construct output from final_answer: {e}") from e
 
         if result.success:

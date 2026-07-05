@@ -1,127 +1,147 @@
-"""JSON memory backend backed by TinyDB for stable document IDs."""
+"""JSON-file-backed memory backend with stable per-entry ids for list parameters.
 
-from collections.abc import Callable, Sequence
+Stores a memory schema as a Pydantic model serialized to a JSON file,
+namespaced per ``actor_id``. Scalar and procedural consolidation (merging
+feedback into values) use internal AI functions that rewrite the value; list
+consolidation is *agentic*: an internal AI function is handed CRUD tools
+scoped to the parameter (:class:`MemoryToolProvider`) and edits the store
+entry by entry, so untouched entries are never paraphrased or dropped.
+
+Every list entry has a stable string id, allocated from a persisted
+per-parameter monotonic counter and **never reused** — an id recorded in an
+event log during the forward pass (``search`` puts ``{"results": {entry_id:
+value}}`` in its derivation meta) still resolves to the same logical entry at
+consolidation time, across saves, deletes, other consolidations, and reopens.
+
+File format (version 2)::
+
+    {actor_id: {"_format": 2,
+                "data": <schema dump>,
+                "lists": {param: {"next_id": int, "ids": [str, ...]}}}}
+
+Legacy files (a bare schema dump per actor) are read transparently; their list
+entries get fresh ids, and ``close()`` writes the new format.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
-from strands import tool
 from strands.models import Model
 from strands.tools import ToolProvider
-from strands.types.tools import AgentTool
-from tinydb import Query, TinyDB
-from tinydb.table import Document, Table
+from strands.tools.decorator import tool as _strands_tool  # pyright: ignore[reportUnknownVariableType]
 
-from .. import ai_function
-from ..tools.local_python_executor import SAFE_BUILTINS  # noqa: F401
-from ..types.graph import ParameterGradient
-from ..utils import bullet_points as bullet_points  # noqa: F401
-from ..utils import quiet_console
-from ..utils import to_yaml as to_yaml  # noqa: F401
+from ..ai_thread import ai_function
+from ..ai_thread.postcondition import PostConditionResult
 from .base import DynamicToolProvider, MemoryBackend, ParameterMeta, ValueType
-from .procedural import Procedural, validate_procedural
-from .utils import flatten_schema, is_list_field, unflatten_fields
+from .procedural import validate_procedural
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from strands.types.tools import AgentTool
+
+_FORMAT_KEY = "_format"
+_FORMAT_VERSION = 2
 
 
-@ai_function(callback_handler=None)
-def consolidate_list(memories: dict[int, str], feedback: list[str]) -> Literal["done"]:  # type: ignore[empty-body]
-    """You are a memory manager. The memories listed below were retrieved from a memory store
-    because they are relevant to the feedback. Use the provided tools to search, add, update,
-    or delete memories as needed to incorporate the feedback.
-
-    <retrieved_memories>
-    {to_yaml(memories)}
-    </retrieved_memories>
-
-    <feedback>
-    {bullet_points(feedback)}
-    </feedback>
-
-    After you have applied all necessary changes using the tools, return "done".
-    """
-    ...
+def _bullet_points(values: list[str]) -> str:
+    return "\n".join(f"- {v}" for v in values)
 
 
-@ai_function(callback_handler=None)
-def consolidate_value(value: str, feedback: list[str]) -> str:  # type: ignore[empty-body]
-    """Please update the following value with the feedback provided below.
-    The feedback could describe information to add, change, or consolidate.
-    Return the updated value.
-
-    <value>
-    {value}
-    </value>
-
-    <feedback>
-    {bullet_points(feedback)}
-    </feedback>
-    """
-    ...
+def _check_valid_python(response: str) -> PostConditionResult:
+    """Post-condition: consolidated procedural code must parse as Python."""
+    try:
+        validate_procedural(response)
+    except SyntaxError as exc:
+        return PostConditionResult(passed=False, message=f"Code is not valid Python: {exc}")
+    return PostConditionResult(passed=True)
 
 
-def validate(result: str) -> None:
-    """Validate procedural code output."""
-    validate_procedural(result)
+@ai_function[str](structured_output=False)
+def _consolidate_list(memories: str, feedback: str) -> str:
+    """Drive the list-consolidation agent: edit entries with the memory tools."""
+    return (
+        "You are a memory manager. The memory entries listed below were retrieved from a "
+        "memory store because they are relevant to the feedback. Use the provided tools to "
+        "search, add, update, or delete entries as needed to incorporate the feedback.\n\n"
+        f"<retrieved_memories>\n{memories}\n</retrieved_memories>\n\n"
+        f"<feedback>\n{feedback}\n</feedback>\n\n"
+        "Rules:\n"
+        "- Update or delete entries by the entry_id shown above; use search_memories to find others.\n"
+        "- Prefer updating an existing entry over adding a near-duplicate.\n"
+        "- Keep each entry concise and self-contained.\n"
+        '- After you have applied all necessary changes using the tools, answer exactly "done".'
+    )
 
 
-@ai_function(callback_handler=None, post_conditions=[validate])
-def consolidate_procedural(value: str, feedback: list[str]) -> Procedural:  # type: ignore[empty-body]
-    """The following code contains functions that an AI agent could find useful
-    to call accomplish a task. The code will be executed during the agent initialization
-    to make these functions available inside its Python environment.
-
-    <code>
-    {value}
-    </code>
-
-    We have received the following feedback on regarding what to add, remove or how to
-    modify the code:
-
-    <feedback>
-    {bullet_points(feedback)}
-    </feedback>
-
-    Please write and return a new version of the code incorporating the feedback above.
-    <rules>
-    - You need to rewrite the entire code, not only the changes
-    - Keep the code clean and minimal. Remove near-duplicated functions. Create reusable abstractions.
-    - There is no need to maintain backward compatibility. Rewrite the code in the best possible way.
-    - You can only import the following modules: {", ".join(SAFE_BUILTINS)}
-    - Your answer MUST be a string containing valid Python-code that can be executed as is.
-    - DO NOT enclose your answer in Markdown formatting like ```python
-    - The code MUST only contain function definitions. DO NOT define classes.
-    - Each function should be simple (a few lines long) and modular.
-    - Do not use complex syntax. Do not use advanced Python features.
-    </rules>
-    <docstring_rules>
-    Functions that the agent should call directly should have a docstring containing:
-    - A description of when to use the function
-    - Examples of inputs to which the function is applicable
-    - Example of the expected output
-    The agent should be able to decide whether to use the function by only looking at the docstring
-
-    The name of utility functions that the agent should not call directly MUST start with an underscore _
-    </docstring_rules>
-    """
-    ...
+@ai_function[str]
+def _consolidate_value(value: str, feedback: list[str]) -> str:
+    """Build the prompt to merge feedback into a scalar-valued parameter."""
+    return (
+        "Update the following value with the feedback provided.\n"
+        "Return the updated value.\n\n"
+        f"<value>\n{value}\n</value>\n\n"
+        f"<feedback>\n{_bullet_points(feedback)}\n</feedback>"
+    )
 
 
-@ai_function(callback_handler=None)
-def query_value(value: str, query: str) -> str:  # type: ignore[empty-body]
-    """Based on the content below, please answer the following question:
-    <question>
-    {query}
-    </question>
+@ai_function[str](post_conditions=[_check_valid_python])
+def _consolidate_procedural(value: str, feedback: list[str]) -> str:
+    """Build the prompt to merge feedback into a code-valued parameter."""
+    return (
+        "Update the following code with the feedback provided.\n"
+        "Return the complete updated code as a string.\n\n"
+        f"<code>\n{value}\n</code>\n\n"
+        f"<feedback>\n{_bullet_points(feedback)}\n</feedback>"
+    )
 
-    <content>
-    {value}
-    </content>
-    """
-    ...
+
+@ai_function[str]
+def _query_value(value: str, query: str) -> str:
+    """Build the prompt to answer a question over a parameter's value."""
+    return (
+        "Based on the content below, answer the following question:\n"
+        f"<question>{query}</question>\n"
+        f"<content>{value}</content>"
+    )
+
+
+def _get_nested_attr(obj: Any, path: str) -> Any:  # pyright: ignore[reportExplicitAny]
+    for part in path.split("/"):
+        obj = getattr(obj, part)  # pyright: ignore[reportAny]
+    return obj  # pyright: ignore[reportAny]
+
+
+def _set_nested_attr(obj: Any, path: str, value: Any) -> None:  # pyright: ignore[reportExplicitAny]
+    parts = path.split("/")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)  # pyright: ignore[reportAny]
+    setattr(obj, parts[-1], value)  # pyright: ignore[reportAny]
+
+
+def _is_str_list_field(annotation: Any) -> bool:  # pyright: ignore[reportExplicitAny]
+    """Return whether ``annotation`` is ``list[str]`` (possibly Optional-wrapped)."""
+    import typing
+
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        args = typing.get_args(annotation)
+        return bool(args) and args[0] is str
+    # Unwrap Optional[list[str]] / Annotated[...] and re-check the members.
+    for arg in typing.get_args(annotation):
+        if _is_str_list_field(arg):
+            return True
+    return False
 
 
 class JSONMemoryBackend(MemoryBackend):
-    """Memory backend using TinyDB for JSON persistence."""
+    """File-backed memory using JSON serialization with stable list-entry ids."""
 
     def __init__(
         self,
@@ -129,315 +149,435 @@ class JSONMemoryBackend(MemoryBackend):
         actor_id: str,
         path: Path | str,
         model: Model | str | None = None,
-        quiet: bool = True,
     ) -> None:
-        """Initialize the JSON memory backend.
+        super().__init__(schema, actor_id)
+        self.path = Path(path)
+
+        self._consolidate_value_fn = _consolidate_value.replace(model=model)
+        self._consolidate_procedural_fn = _consolidate_procedural.replace(model=model)
+        self._consolidate_list_fn = _consolidate_list.replace(model=model)
+        self._query_value_fn = _query_value.replace(model=model)
+
+        self._all_actors: dict[str, dict[str, Any]] = {}  # pyright: ignore[reportExplicitAny]
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open() as f:
+                self._all_actors = json.load(f)
+
+        # Entry ledgers for list parameters: ids aligned with list order, plus
+        # a persisted monotonic counter per parameter (ids are never reused).
+        self._ids: dict[str, list[str]] = {}
+        self._next_id: dict[str, int] = {}
+
+        raw = self._all_actors.get(actor_id)
+        if raw is not None:
+            data, lists = self._split_record(raw)
+            self._model = schema.model_validate(data)
+            for name, ledger in lists.items():
+                self._ids[name] = [str(i) for i in ledger.get("ids", [])]  # pyright: ignore[reportAny]
+                self._next_id[name] = int(ledger.get("next_id", 1))  # pyright: ignore[reportAny]
+        else:
+            self._model = schema()
+        self._ensure_ledgers()
+
+    # -- Ledger bookkeeping ------------------------------------------------------
+
+    @staticmethod
+    def _split_record(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
+        """Split a per-actor record into ``(schema data, list ledgers)``.
+
+        Recognizes the versioned format; a legacy record (bare schema dump)
+        yields empty ledgers, so its list entries get fresh ids.
+        """
+        if raw.get(_FORMAT_KEY) == _FORMAT_VERSION:
+            return raw.get("data", {}), raw.get("lists", {})
+        return raw, {}
+
+    def _record(self) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
+        """Serialize this actor's state in the versioned file format."""
+        lists = {
+            name: {"next_id": self._next_id[name], "ids": list(self._ids[name])}
+            for name in self._list_parameter_names()
+        }
+        return {_FORMAT_KEY: _FORMAT_VERSION, "data": self._model.model_dump(), "lists": lists}
+
+    def _list_parameter_names(self) -> list[str]:
+        """Leaf parameter paths whose fields are list-valued."""
+        return [name for name in self._leaf_parameter_names() if self._is_list_field(name)]
+
+    def _alloc_id(self, name: str) -> str:
+        """Allocate the next entry id for ``name`` (monotonic, never reused)."""
+        n = self._next_id.get(name, 1)
+        self._next_id[name] = n + 1
+        return str(n)
+
+    def _ensure_ledgers(self) -> None:
+        """Make every list parameter's ledger exist and align with its values.
+
+        Every list parameter ends up with both an id list and a counter, even
+        when the list is empty (an empty list is a valid, aligned ledger — not
+        a missing one). A ledger that is absent or misaligned (legacy file,
+        external edit) is rebuilt with fresh ids; an aligned one is left
+        untouched so its ids stay stable.
+        """
+        for name in self._list_parameter_names():
+            self._next_id.setdefault(name, 1)
+            values = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+            if not isinstance(values, list):
+                self._ids.setdefault(name, [])
+                continue
+            if name not in self._ids or len(self._ids[name]) != len(values):  # pyright: ignore[reportUnknownArgumentType]
+                self._ids[name] = [self._alloc_id(name) for _ in values]  # pyright: ignore[reportUnknownVariableType]
+
+    def list_entries(self, name: str) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
+        """Return ``{entry_id: value}`` for a list parameter, in list order.
 
         Args:
-            schema: Pydantic model defining the memory structure.
-            actor_id: Unique identifier for the actor.
-            path: File path for the TinyDB JSON store.
-            model: LLM model for consolidation operations.
-            quiet: Whether to suppress console output.
+            name: Parameter name (slash-separated for nested fields).
+
+        Raises:
+            TypeError: ``name`` is not a list parameter (search and entry CRUD
+                are only supported for list parameters).
         """
-        super().__init__(schema, actor_id)
-        self.quiet = quiet
+        if not self._is_list_field(name):
+            raise TypeError(f"Entry operations are only supported for list parameters, but '{name}' is not one.")
+        values = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+        return dict(zip(self._ids[name], values, strict=True))  # pyright: ignore[reportUnknownArgumentType]
 
-        self.consolidate_value = consolidate_value.replace(model=model)
-        self.consolidate_procedural = consolidate_procedural.replace(model=model)
-        self.consolidate_list = consolidate_list.replace(model=model)
-        self.query_value = query_value.replace(model=model)
+    # -- Entry CRUD (used by MemoryToolProvider and the consolidation agent) -----
 
-        self._db = TinyDB(Path(path))
-        self._scalars: Table = self._db.table(f"{actor_id}/_scalars")
-        self._leaf_fields = flatten_schema(schema)
-        if not self._actor_exists():
-            self._seed_defaults()
+    def _list_add(self, name: str, value: str) -> str:
+        """Append a new entry and return its stable entry id."""
+        entries = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+        entry_id = self._alloc_id(name)
+        entries.append(value)  # pyright: ignore[reportUnknownMemberType]
+        self._ids[name].append(entry_id)
+        return entry_id
 
-    def __str__(self) -> str:
-        """Return a YAML representation of the memory contents."""
-        return to_yaml(self._hydrate().model_dump())
+    def _list_update(self, name: str, entry_id: str, value: str) -> bool:
+        """Replace an entry's value by id, keeping the id. True on success."""
+        try:
+            index = self._ids[name].index(entry_id)
+        except (KeyError, ValueError):
+            return False
+        _get_nested_attr(self._model, name)[index] = value
+        return True
 
-    def _table(self, name: str) -> Table:
-        """Return the TinyDB table for a list parameter, namespaced by actor_id."""
-        return self._db.table(f"{self.actor_id}/{name}")
+    def _list_remove(self, name: str, entry_id: str) -> bool:
+        """Remove an entry by id (the id is retired, never reused). True on success."""
+        try:
+            index = self._ids[name].index(entry_id)
+        except (KeyError, ValueError):
+            return False
+        del _get_nested_attr(self._model, name)[index]
+        del self._ids[name][index]
+        return True
 
-    def _actor_exists(self) -> bool:
-        """Return True if this actor already has data in the database."""
-        return len(self._scalars) > 0 or any(
-            len(self._table(path)) > 0 for path, fi in self._leaf_fields if is_list_field(fi)
-        )
-
-    def _seed_defaults(self) -> None:
-        """Persist schema defaults for a new actor."""
-        Q = Query()
-        for path, field_info in self._leaf_fields:
-            default = field_info.default
-            if is_list_field(field_info):
-                table = self._table(path)
-                if default:
-                    for v in default:
-                        table.insert({"value": v})
-            else:
-                if default is not None:
-                    self._scalars.upsert({"name": path, "value": default}, Q.name == path)
-
-    def _hydrate(self) -> BaseModel:
-        """Rebuild the Pydantic model from TinyDB tables."""
-        flat: dict[str, Any] = {}
-        for doc in self._scalars.all():
-            flat[doc["name"]] = doc["value"]
-        for path, field_info in self._leaf_fields:
-            if path not in flat and is_list_field(field_info):
-                flat[path] = [doc["value"] for doc in self._table(path).all()]
-        for path, field_info in self._leaf_fields:
-            if path not in flat:
-                flat[path] = field_info.default
-        return self.schema.model_validate(unflatten_fields(flat))
-
-    def dump(self) -> BaseModel:
-        """Return the entire memory content as the underlying Pydantic model."""
-        return self._hydrate()
-
-    # Utilities to read from TinyDB
-
-    def _read_scalar(self, name: str) -> str:
-        """Read a scalar value from the _scalars table."""
-        Q = Query()
-        doc = self._scalars.get(Q.name == name)
-        if doc is None:
-            default = self._resolve_field(name).default
-            return str(default) if default is not None else ""
-        return str(doc["value"])  # type: ignore[call-overload]
-
-    def _read_list(self, name: str) -> list[str]:
-        """Read all values from a list table."""
-        return [str(doc["value"]) for doc in self._table(name).all()]
-
-    def _read_value(self, name: str) -> ValueType:
-        """Read a value, dispatching to scalar or list based on schema."""
-        field_info = self._resolve_field(name)
-        if is_list_field(field_info):
-            return self._read_list(name)
-        return self._read_scalar(name)
-
-    # MemoryBackend abstract method implementations
+    # -- Abstract storage contract ------------------------------------------------
 
     def _save(self, name: str, value: ValueType) -> None:
-        if isinstance(value, list):
-            table = self._table(name)
-            table.truncate()
-            for v in value:
-                table.insert({"value": v})
+        _set_nested_attr(self._model, name, value)
+        if self._is_list_field(name) and isinstance(value, list):
+            # A wholesale replace retires the old entries; new ones get fresh
+            # ids (the counter is monotonic, so retired ids are never reused).
+            self._ids[name] = [self._alloc_id(name) for _ in value]
+
+    def _consolidate(
+        self,
+        name: str,
+        feedback: list[str],
+        retrieved: dict[str, str] | None = None,
+        **kwargs: Any,  # pyright: ignore[reportExplicitAny]
+    ) -> None:
+        if self._is_procedural(name):
+            value = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+            value = self._consolidate_procedural_fn.run_sync(value=value, feedback=feedback)
+            _set_nested_attr(self._model, name, value)
+        elif self._is_list_field(name):
+            # The agentic consolidator's CRUD tools are typed for str entries;
+            # routing a list[BaseModel] through them would corrupt the schema.
+            if not _is_str_list_field(self._resolve_field(name).annotation):
+                raise NotImplementedError(
+                    f"JSONMemoryBackend cannot consolidate non-string list parameter '{name}'. "
+                    f"Only list[str] (and str / Procedural) fields are supported."
+                )
+            self._consolidate_entries(name, feedback, retrieved)
         else:
-            Q = Query()
-            self._scalars.upsert({"name": name, "value": value}, Q.name == name)
+            value = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+            value = self._consolidate_value_fn.run_sync(value=value, feedback=feedback)
+            _set_nested_attr(self._model, name, value)
+
+    def _consolidate_entries(self, name: str, feedback: list[str], retrieved: dict[str, str] | None) -> None:
+        """Agentic list consolidation: an AI function edits entries via CRUD tools.
+
+        The prompt shows the *current* values of the retrieved entries (ids
+        from the search derivation meta, values re-read from the store — an
+        entry may have been updated since the search). Stale ids (entries
+        deleted since the search) are dropped; with no retrieval context, or
+        none of it still valid, the full entry set is shown.
+        """
+        from ..optimizer._formatting import to_yaml
+
+        entries = self.list_entries(name)
+        snapshot = {i: entries[i] for i in (retrieved or {}) if i in entries} or entries
+        fn = self._consolidate_list_fn.replace(tools=[MemoryToolProvider(self, name)])
+        fn.run_sync(memories=to_yaml(snapshot), feedback=_bullet_points(feedback))
+
+    def _delete(self, name: str) -> None:
+        """Reset a parameter to its schema default."""
+        field_info = self._resolve_field(name)
+        # A required field has no default to reset to; surface it clearly.
+        if field_info.is_required():
+            raise ValueError(f"Cannot delete required parameter '{name}': it has no schema default.")
+        default = field_info.get_default(call_default_factory=True)  # pyright: ignore[reportAny]
+        _set_nested_attr(self._model, name, default)
+        if self._is_list_field(name) and isinstance(default, list):
+            self._ids[name] = [self._alloc_id(name) for _ in default]  # pyright: ignore[reportUnknownVariableType]
 
     def _recall(self, name: str) -> tuple[ValueType, ParameterMeta]:
-        return self._read_value(name), {}
+        return _get_nested_attr(self._model, name), {}
 
     def _query(self, name: str, query: str) -> tuple[str, ParameterMeta]:
-        value = self._read_value(name)
-        with quiet_console(self.quiet):
-            answer = self.query_value(str(value), query)
-        return answer, {}
+        value = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
+        return self._query_value_fn.run_sync(value=value, query=query), {}
 
-    def _search(self, name: str, query: str, k: int = 5) -> tuple[list[str], ParameterMeta]:
-        """Return (top_k_values, meta) with meta containing {doc_id: value} mapping."""
-        docs = self._search_docs(name, query, k)
-        results = {d.doc_id: d["value"] for d in docs}
-        return [d["value"] for d in docs], {"results": results}
+    def _search(self, name: str, query: str, k: int = 5, **kwargs: Any) -> tuple[list[str], ParameterMeta]:  # pyright: ignore[reportExplicitAny]
+        """Return the top-k entries of a list parameter, ranked by BM25 against query.
 
-    def _search_docs(self, name: str, query: str, k: int = 5) -> list[Document]:
-        """Return top-k TinyDB Document objects ranked by BM25."""
+        Only supported for ``list[str]`` parameters. The meta carries
+        ``{"results": {entry_id: value}}`` for the returned entries, in rank
+        order — recorded into the recall event so consolidation can target
+        exactly the entries the forward pass retrieved.
+        """
+        ranked = self._search_entries(name, query, k)
+        return [value for _, value in ranked], {"results": dict(ranked)}
+
+    def _search_entries(self, name: str, query: str, k: int = 5) -> list[tuple[str, str]]:
+        """Return the top-k ``(entry_id, value)`` pairs ranked by BM25."""
+        entries = self.list_entries(name)
+        if not entries:
+            return []
+        corpus = [(entry_id, str(value)) for entry_id, value in entries.items()]  # pyright: ignore[reportAny]
+
         from rank_bm25 import BM25Okapi
 
-        table = self._table(name)
-        all_docs = table.all()
-        if not all_docs:
-            return []
+        bm25 = BM25Okapi([value.lower().split() for _, value in corpus])
+        scores = bm25.get_scores(query.lower().split())  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        ranked = sorted(zip(corpus, scores, strict=True), key=lambda pair: pair[1], reverse=True)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType, reportUnknownLambdaType]
+        return [pair for pair, _ in ranked[:k]]  # pyright: ignore[reportUnknownVariableType]
 
-        corpus = [d["value"] for d in all_docs]
-        tokenized = [v.lower().split() for v in corpus]
-        bm25 = BM25Okapi(tokenized)
-        scores = bm25.get_scores(query.lower().split())
-        scored = sorted(zip(all_docs, scores, strict=False), key=lambda x: x[1], reverse=True)
-        return [doc for doc, _ in scored[:k]]
+    # -- Tool provider (adds entry CRUD tools for list parameters) ---------------
 
-    def delete(self, name: str) -> None:
-        """Delete a parameter."""
-        field_info = self._resolve_field(name)
-        if is_list_field(field_info):
-            self._table(name).truncate()
-        else:
-            Q = Query()
-            self._scalars.remove(Q.name == name)
+    def tool_provider(self, *names: str, operations: set[str] | None = None) -> DynamicToolProvider:
+        """Extend the base tools with entry-id-based CRUD tools for list parameters.
 
-    def _consolidate(self, name: str, feedback: list[ParameterGradient]) -> None:
-        texts = [g.feedback for g in feedback]
-        value = self._read_value(name)
-        with quiet_console(self.quiet):
-            if self._is_procedural(name):
-                assert isinstance(value, str)
-                value = self.consolidate_procedural(value, texts)
-                self._save(name, value)
-            elif isinstance(value, list):
-                # Merge {doc_id: value} dicts from all search derivations
-                retrieved: dict[int, str] = {}
-                for g in feedback:
-                    for doc_id, val in g.derivation.meta.get("results", {}).items():
-                        retrieved[doc_id] = val
-                # Fall back to all docs if no search derivations
-                if not retrieved:
-                    retrieved = {d.doc_id: d["value"] for d in self._table(name).all()}
-                fn = self.consolidate_list.replace(tools=[MemoryToolProvider(self, name)])
-                fn(retrieved, texts)
-            else:
-                assert isinstance(value, str)
-                value = self.consolidate_value(value, texts)
-                self._save(name, value)
+        In addition to the base ``recall_<name>`` / ``query_<name>`` /
+        ``search_<name>`` (and scalar ``save_<name>`` / ``delete_<name>``),
+        list parameters get ``add_to_<name>``, ``update_<name>``, and
+        ``delete_from_<name>`` operating on stable entry ids.
 
-    def tool_provider(self, *names: str, operations: set[str] | None = None) -> "DynamicToolProvider":
-        """Extend base tool_provider with doc_id-based list CRUD tools."""
-        from .utils import is_list_field
+        Args:
+            names: One or more parameter names (slash-separated for nested fields).
+            operations: Restrict to this subset of ``{"recall", "query",
+                "search", "save", "delete", "add", "update"}``; all applicable
+                tools if ``None``.
 
+        Returns:
+            A ``DynamicToolProvider`` holding the generated tools.
+        """
         ops = operations or {"recall", "query", "search", "save", "delete", "add", "update"}
         provider = super().tool_provider(*names, operations=ops)
-        extra: list = []
+        extra: list[AgentTool] = []
         for name in names:
-            field_info = self._resolve_field(name)
-            if not is_list_field(field_info):
+            if not self._is_list_field(name):
                 continue
             desc = self._get_description(name) or name
             safe = name.replace("/", "_")
-
             if "add" in ops:
                 extra.append(
-                    tool(name=f"add_to_{safe}", description=f"Add a new entry to: {desc}")(self._make_list_add(name))
+                    _strands_tool(name=f"add_to_{safe}", description=f"Add a new entry to: {desc}")(
+                        self._make_entry_add_tool(name)
+                    )
                 )
             if "update" in ops:
                 extra.append(
-                    tool(name=f"update_{safe}", description=f"Update an entry by doc_id in: {desc}")(
-                        self._make_list_update(name)
+                    _strands_tool(name=f"update_{safe}", description=f"Update an entry by entry_id in: {desc}")(
+                        self._make_entry_update_tool(name)
                     )
                 )
             if "delete" in ops:
                 extra.append(
-                    tool(name=f"delete_from_{safe}", description=f"Delete an entry by doc_id from: {desc}")(
-                        self._make_list_delete(name)
+                    _strands_tool(name=f"delete_from_{safe}", description=f"Delete an entry by entry_id from: {desc}")(
+                        self._make_entry_delete_tool(name)
                     )
                 )
+        return DynamicToolProvider(provider.tools + extra)
 
-        return DynamicToolProvider(provider._tools + extra)
-
-    def _make_list_add(self, param_name: str) -> Callable[[str], str]:
+    def _make_entry_add_tool(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
         def _add(value: str) -> str:
             """Add a new entry to this list.
 
             Args:
                 value: The text content of the new entry.
             """
-            doc_id = self._list_add(param_name, value)
-            return f"Added with doc_id={doc_id}"
+            return f"Added with entry_id={self._list_add(name, value)}"
 
         return _add
 
-    def _make_list_update(self, param_name: str) -> Callable[..., str]:
-        def _update(doc_id: int, value: str) -> str:
-            """Update an existing entry by its stable doc_id.
+    def _make_entry_update_tool(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
+        def _update(entry_id: str, value: str) -> str:
+            """Update an existing entry by its stable entry_id.
 
             Args:
-                doc_id: The stable identifier of the entry to update.
+                entry_id: The stable identifier of the entry to update.
                 value: The new text content.
             """
-            if not self._list_update(param_name, doc_id, value):
-                raise ValueError(f"doc_id={doc_id} not found")
-            return f"Updated doc_id={doc_id}"
+            if not self._list_update(name, entry_id, value):
+                raise ValueError(f"entry_id={entry_id} not found")
+            return f"Updated entry_id={entry_id}"
 
         return _update
 
-    def _make_list_delete(self, param_name: str) -> Callable[[int], str]:
-        def _delete(doc_id: int) -> str:
-            """Delete an entry by its stable doc_id.
+    def _make_entry_delete_tool(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
+        def _delete(entry_id: str) -> str:
+            """Delete an entry by its stable entry_id.
 
             Args:
-                doc_id: The stable identifier of the entry to delete.
+                entry_id: The stable identifier of the entry to delete.
             """
-            if not self._list_remove(param_name, doc_id):
-                raise ValueError(f"doc_id={doc_id} not found")
-            return f"Deleted doc_id={doc_id}"
+            if not self._list_remove(name, entry_id):
+                raise ValueError(f"entry_id={entry_id} not found")
+            return f"Deleted entry_id={entry_id}"
 
         return _delete
 
+    # -- Persistence ---------------------------------------------------------------
+
     def close(self) -> None:
-        """Close the TinyDB database."""
-        self._db.close()
+        """Persist this actor's current values back to the JSON file.
 
-    # List CRUD operations used as tools by the consolidate_list agent
+        Re-reads the file and merges in only this actor's key, so concurrent
+        backends sharing one file do not clobber each other (the in-memory
+        snapshot taken at construction may be stale). Writes atomically
+        (temp-file + rename) so a crash mid-write cannot corrupt the file for
+        other actors. Other actors' records are preserved byte-for-byte,
+        whatever format they are in.
+        """
+        on_disk: dict[str, dict[str, Any]] = {}  # pyright: ignore[reportExplicitAny]
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open() as f:
+                on_disk = json.load(f)
 
-    def _list_add(self, name: str, value: str) -> int:
-        """Insert a new entry and return its stable doc_id."""
-        return int(self._table(name).insert({"value": value}))
+        on_disk[self.actor_id] = self._record()
+        self._all_actors = on_disk
 
-    def _list_update(self, name: str, doc_id: int, value: str) -> bool:
-        """Update an entry by doc_id. Returns True on success."""
-        table = self._table(name)
-        if table.get(doc_id=doc_id) is None:
-            return False
-        table.update({"value": value}, doc_ids=[doc_id])
-        return True
+        # Atomic write: temp file in the same dir, then os.replace (matches the
+        # pattern in discovery.py / session.py). A crash mid-write leaves the
+        # prior file intact for all actors.
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=str(self.path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(on_disk, fh)
+            os.replace(tmp_path, self.path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
-    def _list_remove(self, name: str, doc_id: int) -> bool:
-        """Remove an entry by doc_id. Returns True on success."""
-        table = self._table(name)
-        if table.get(doc_id=doc_id) is None:
-            return False
-        table.remove(doc_ids=[doc_id])
-        return True
+    def dump(self) -> BaseModel:
+        """Return the underlying Pydantic model.
+
+        Read-only by contract: mutating a list field on the returned model
+        directly bypasses the entry-id ledger. Go through ``save`` or the
+        entry CRUD tools instead.
+        """
+        return self._model
+
+    def __str__(self) -> str:
+        """Return a human-readable YAML dump of the current values.
+
+        Uses ``to_yaml`` so multi-line values (e.g. ``Procedural`` code) render
+        as unquoted literal blocks rather than escaped one-line scalars.
+        """
+        from ..optimizer._formatting import to_yaml
+
+        return to_yaml(self._model.model_dump())
 
 
 class MemoryToolProvider(ToolProvider):
-    """Provides CRUD tools scoped to a single list[str] parameter on a JSONMemoryBackend."""
+    """CRUD tools scoped to one ``list[str]`` parameter on a :class:`JSONMemoryBackend`.
+
+    Handed to the list-consolidation agent (and usable directly on any agent)
+    so it can search, add, update, and delete entries by their stable
+    ``entry_id`` instead of rewriting the whole list.
+    """
 
     def __init__(self, backend: JSONMemoryBackend, name: str) -> None:
-        """Initialize with a backend and parameter name."""
+        """Scope the tools to ``name`` on ``backend``."""
         self._backend = backend
         self._name = name
-        self._consumers: set[Any] = set()
+        self._consumers: set[object] = set()
+        self._tools: list[AgentTool] = self._build_tools()
 
-    @tool
-    def search_memories(self, query: str, k: int = 5) -> list[dict[str, Any]]:
-        """Search memories by keyword relevance. Returns a list of {doc_id, value} dicts."""
-        return [{"doc_id": d.doc_id, "value": d["value"]} for d in self._backend._search_docs(self._name, query, k)]
+    def _build_tools(self) -> list[AgentTool]:
+        backend, name = self._backend, self._name
 
-    @tool
-    def add_memory(self, value: str) -> str:
-        """Add a new memory entry to the list. Returns the doc_id of the new entry."""
-        doc_id = self._backend._list_add(self._name, value)
-        return f"Added with doc_id={doc_id}"
+        def search_memories(query: str, k: int = 5) -> list[dict[str, str]]:
+            """Search entries by keyword relevance.
 
-    @tool
-    def update_memory(self, doc_id: int, value: str) -> str:
-        """Update an existing memory entry by its stable doc_id."""
-        if not self._backend._list_update(self._name, doc_id, value):
-            raise ValueError(f"doc_id={doc_id} not found")
-        return f"Updated doc_id={doc_id}"
+            Args:
+                query: Keywords to match against entry texts.
+                k: Maximum number of results.
 
-    @tool
-    def delete_memory(self, doc_id: int) -> str:
-        """Delete a memory entry by its stable doc_id."""
-        if not self._backend._list_remove(self._name, doc_id):
-            raise ValueError(f"doc_id={doc_id} not found")
-        return f"Deleted doc_id={doc_id}"
+            Returns:
+                A list of ``{"entry_id": ..., "value": ...}`` dicts, most
+                relevant first.
+            """
+            return [{"entry_id": i, "value": v} for i, v in backend._search_entries(name, query, k)]  # noqa: SLF001
 
-    async def load_tools(self, **kwargs: Any) -> Sequence[AgentTool]:
-        """Return the CRUD tools for the memory list."""
-        return [self.search_memories, self.add_memory, self.update_memory, self.delete_memory]
+        def add_memory(value: str) -> str:
+            """Add a new memory entry to the list.
 
-    def add_consumer(self, consumer_id: Any, **kwargs: Any) -> None:
-        """Add a consumer."""
-        pass
+            Args:
+                value: The text content of the new entry.
+            """
+            return f"Added with entry_id={backend._list_add(name, value)}"  # noqa: SLF001
 
-    def remove_consumer(self, consumer_id: Any, **kwargs: Any) -> None:
-        """Remove a consumer."""
-        pass
+        def update_memory(entry_id: str, value: str) -> str:
+            """Update an existing memory entry by its stable entry_id.
+
+            Args:
+                entry_id: The stable identifier of the entry to update.
+                value: The new text content.
+            """
+            if not backend._list_update(name, entry_id, value):  # noqa: SLF001
+                raise ValueError(f"entry_id={entry_id} not found")
+            return f"Updated entry_id={entry_id}"
+
+        def delete_memory(entry_id: str) -> str:
+            """Delete a memory entry by its stable entry_id.
+
+            Args:
+                entry_id: The stable identifier of the entry to delete.
+            """
+            if not backend._list_remove(name, entry_id):  # noqa: SLF001
+                raise ValueError(f"entry_id={entry_id} not found")
+            return f"Deleted entry_id={entry_id}"
+
+        return [
+            _strands_tool(name="search_memories", description="Search entries by keyword relevance.")(search_memories),
+            _strands_tool(name="add_memory", description="Add a new entry to the list.")(add_memory),
+            _strands_tool(name="update_memory", description="Update an entry by its entry_id.")(update_memory),
+            _strands_tool(name="delete_memory", description="Delete an entry by its entry_id.")(delete_memory),
+        ]
+
+    async def load_tools(self, **kwargs: object) -> Sequence[AgentTool]:
+        """Return the CRUD tools."""
+        return self._tools
+
+    def add_consumer(self, consumer_id: object, **kwargs: object) -> None:
+        """Register a consumer (bookkeeping only)."""
+        self._consumers.add(consumer_id)
+
+    def remove_consumer(self, consumer_id: object, **kwargs: object) -> None:
+        """Deregister a consumer (bookkeeping only)."""
+        self._consumers.discard(consumer_id)

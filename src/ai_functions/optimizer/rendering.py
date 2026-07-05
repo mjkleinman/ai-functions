@@ -1,102 +1,135 @@
-"""Rendering utilities for optimizer traces and messages."""
+"""Render parameters and message traces into text/XML for the backward prompt."""
+
+from __future__ import annotations
 
 import json
+from collections.abc import Callable, Sequence
 from typing import Any
 from xml.sax.saxutils import escape
 
 from strands.types.content import Message
 
-from ..types.graph import Node, ParameterView
-from ..utils._formatting import to_yaml, truncate
+from ..types.graph import Node, ParameterNode, ThreadNode
+from ._formatting import to_yaml, truncate
 
 
-def render_inputs(nodes: list[Node]) -> str:
-    """Render a list of graph nodes as a YAML string for the optimizer prompt."""
-    result = {}
+def _yaml_safe_value(value: Any) -> Any:  # pyright: ignore[reportExplicitAny]
+    """Convert a value to a YAML-safe form (custom objects become str())."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: _yaml_safe_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_yaml_safe_value(item) for item in value]
+    return str(value)
+
+
+def render_inputs(nodes: Sequence[Node]) -> str:
+    """Render backward-pass targets as a YAML string keyed by ``node_id``.
+
+    Each target carries a ``type`` the backward prompt keys off. Grad-enabled
+    ``ParameterNode`` s render as ``type: parameter`` (or ``type: code`` for
+    procedural parameters, so the model treats them as code to edit); child
+    ``ThreadNode`` s render as ``type: result`` (a downstream function output
+    that can be improved). The distinction lets the model route feedback to the
+    right target instead of dumping everything into the one visible parameter.
+    """
+    result: dict[str, Any] = {}  # pyright: ignore[reportExplicitAny]
     for node in nodes:
-        node_type = node.__class__.__name__.lower()
-        if isinstance(node, ParameterView) and node.procedural:
-            node_type = "code"
-        result[node.name] = {
+        if isinstance(node, ParameterNode):
+            node_type = "code" if node.procedural else "parameter"
+        elif isinstance(node, ThreadNode):
+            node_type = "result"
+        else:
+            node_type = node.__class__.__name__.lower()
+        result[node.node_id] = {
             "type": node_type,
             "description": getattr(node, "description", ""),
-            "value": node.value,
+            "value": _yaml_safe_value(node.value),
         }
-        if not result[node.name]["description"]:
-            del result[node.name]["description"]
+        if not result[node.node_id]["description"]:
+            del result[node.node_id]["description"]
     return to_yaml(result)
 
 
-def _convert_id(tool_id: str | None, tool_id_to_tool_result_id: dict[str, str]) -> tuple[str, str]:
-    call_type = "function" if tool_id is not None and tool_id in tool_id_to_tool_result_id else "tool"
-    resolved_id = tool_id_to_tool_result_id.get(tool_id or "", tool_id or "")
-    return resolved_id, call_type
+def _convert_id(tool_id: str | None, tool_id_to_tool_result_id: dict[str, str]) -> tuple[str | None, str]:
+    call_type = "function" if tool_id in tool_id_to_tool_result_id else "tool"
+    tool_id = tool_id_to_tool_result_id.get(tool_id, tool_id) if tool_id is not None else tool_id
+    return tool_id, call_type
 
 
-def _collect_tool_results(messages: list[Message]) -> dict[str, dict]:
+def _collect_tool_results(
+    messages: list[Message],
+    maybe_truncate: Callable[[Any], Any] = truncate,  # pyright: ignore[reportExplicitAny]
+) -> dict[str, dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
     """Build a map from toolUseId to its result data across all messages."""
-    results_map: dict[str, dict] = {}
+    results_map: dict[str, dict[str, Any]] = {}  # pyright: ignore[reportExplicitAny]
     for message in messages:
         for block in message.get("content", []):
+            if not isinstance(block, dict):
+                continue
             if tool_result := block.get("toolResult", None):
-                use_id: str | None = tool_result.get("toolUseId")
+                use_id = tool_result.get("toolUseId")
                 if use_id is None:
                     continue
-                results = []
-                for tool_result_content in tool_result.get("content", []):
-                    if text := tool_result_content.get("text"):
-                        results.append(truncate(text))
-                    elif json_result := tool_result_content.get("json"):
-                        results.append(truncate(json_result))
-                results_map[use_id] = {
-                    "status": tool_result.get("status"),
-                    "results": results,
-                }
+                results: list[Any] = []  # pyright: ignore[reportExplicitAny]
+                for trc in tool_result.get("content", []):
+                    if text := trc.get("text"):
+                        results.append(maybe_truncate(text))
+                    elif json_result := trc.get("json"):
+                        results.append(maybe_truncate(json_result))
+                results_map[use_id] = {"status": tool_result.get("status"), "results": results}
     return results_map
 
 
-def render_messages(messages: list[Message] | None, tool_id_to_tool_result_id: dict[str, str]) -> str:
+def render_messages(
+    messages: list[Message] | None,
+    tool_id_to_tool_result_id: dict[str, str] | None = None,
+    should_truncate: bool = True,
+) -> str:
     """Format agent messages into a readable conversation trace string."""
     if not messages:
         return ""
 
-    tool_results_map = _collect_tool_results(messages)
+    if tool_id_to_tool_result_id is None:
+        tool_id_to_tool_result_id = {}
 
-    message_list = []
+    maybe_truncate: Callable[[Any], Any] = truncate if should_truncate else (lambda x: x)  # pyright: ignore[reportExplicitAny]
+
+    tool_results_map = _collect_tool_results(messages, maybe_truncate)
+
+    message_list: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny]
     for i, message in enumerate(messages, 1):
-        msg_dict: dict = {
-            "role": message.get("role", "unknown").upper(),
-            "content": [],
-        }
+        msg_dict: dict[str, Any] = {"role": message.get("role", "unknown").upper(), "content": []}  # pyright: ignore[reportExplicitAny]
         for block in message.get("content", []):
+            if not isinstance(block, dict):
+                continue
             if reasoning_text := block.get("reasoningContent", {}).get("text"):
-                msg_dict["content"].append({"reasoning": truncate(reasoning_text)})
+                msg_dict["content"].append({"reasoning": maybe_truncate(reasoning_text)})
             if text := block.get("text", ""):
-                msg_dict["content"].append({"text": truncate(text)})
+                msg_dict["content"].append({"text": maybe_truncate(text)})
             if tool_use := block.get("toolUse", None):
                 original_id = tool_use.get("toolUseId")
                 _, call_type = _convert_id(original_id, tool_id_to_tool_result_id)
-                entry: dict[str, Any] = {
+                entry: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]
                     "type": f"{call_type}_call",
                     "name": tool_use.get("name"),
-                    "inputs": truncate(tool_use.get("input", {})),
+                    "inputs": maybe_truncate(tool_use.get("input", {})),
                 }
                 if call_type == "function":
                     entry["id"] = tool_id_to_tool_result_id[original_id]
-                # Inline the corresponding result
                 if original_id in tool_results_map:
                     result_data = tool_results_map[original_id]
                     entry["status"] = result_data["status"]
                     entry["output"] = result_data["results"]
                 msg_dict["content"].append(entry)
-            # Skip standalone toolResult blocks — they're inlined above
         if msg_dict["content"]:
             message_list.append({f"message_{i}": msg_dict})
 
     return to_xml(message_list)
 
 
-def _format_tool_inputs(inputs: str) -> str:
+def _format_tool_inputs(inputs: Any) -> str:  # pyright: ignore[reportExplicitAny]
     """Try to pretty-print JSON tool inputs; fall back to raw string."""
     try:
         parsed = json.loads(inputs) if isinstance(inputs, str) else inputs
@@ -107,17 +140,17 @@ def _format_tool_inputs(inputs: str) -> str:
     return str(inputs)
 
 
-def to_xml(message_list: list[dict]) -> str:
+def to_xml(message_list: list[dict[str, Any]]) -> str:  # pyright: ignore[reportExplicitAny]
     """Convert the message_list produced by render_messages into an XML string.
 
-    Each message becomes a ``<message>`` tag with ``number`` and ``role``
-    attributes.  Plain text is placed directly inside the tag.
-    ``python_executor`` tool calls are rendered as ``<execute_code>`` /
-    ``<result>`` pairs; other tool calls use a generic ``<tool_call>`` tag.
+    Each message becomes a ``<message>`` tag with ``step`` and ``role``
+    attributes. All content is XML-escaped so trace text containing ``<`` /
+    ``&`` cannot break out of its tag or corrupt the surrounding structure.
+    ``python_executor`` tool calls render as ``<execute_code>`` / ``<result>``
+    pairs; other tool calls use a generic ``<tool_call>`` tag.
     """
     parts: list[str] = []
     for entry in message_list:
-        # entry is e.g. {"message_3": {"role": "ASSISTANT", "content": [...]}}
         key = next(iter(entry))
         msg = entry[key]
         number = key.split("_", 1)[1]
@@ -128,10 +161,8 @@ def to_xml(message_list: list[dict]) -> str:
         for block in msg["content"]:
             if isinstance(block, dict) and "reasoning" in block:
                 parts.append(f"<reasoning>{escape(str(block['reasoning']))}</reasoning>")
-
             elif isinstance(block, dict) and "text" in block:
                 parts.append(escape(str(block["text"])))
-
             elif isinstance(block, dict) and "type" in block:
                 name = block.get("name", "")
                 inputs_raw = block.get("inputs", "")
@@ -140,7 +171,6 @@ def to_xml(message_list: list[dict]) -> str:
                 output_text = "\n".join(str(o) for o in output_parts)
 
                 if name == "python_executor":
-                    # Extract the code from the JSON inputs
                     try:
                         parsed = json.loads(inputs_raw) if isinstance(inputs_raw, str) else inputs_raw
                         code = parsed.get("code", inputs_raw) if isinstance(parsed, dict) else str(inputs_raw)
@@ -151,7 +181,7 @@ def to_xml(message_list: list[dict]) -> str:
                         parts.append(f"<result>\n{escape(output_text)}\n</result>")
                 else:
                     formatted_inputs = _format_tool_inputs(inputs_raw)
-                    attrs = f' name="{escape(name)}"'
+                    attrs = f' name="{escape(str(name))}"'
                     if status:
                         attrs += f' status="{escape(str(status))}"'
                     inner = f"<inputs>{escape(formatted_inputs)}</inputs>"

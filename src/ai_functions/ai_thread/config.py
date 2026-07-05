@@ -1,0 +1,271 @@
+"""Per-thread execution configuration and its matching kwargs ``TypedDict`` s.
+
+Invariants:
+    ``ThreadConfig`` fields exactly match ``ThreadKwargs`` annotations.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import enum
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, TypedDict, Unpack
+
+from strands.types.tools import AgentTool
+
+from .postcondition import PostCondition
+
+JSONSchema = dict[str, Any]  # pyright: ignore[reportExplicitAny]
+
+if TYPE_CHECKING:
+    from strands.agent import ConversationManager
+    from strands.agent.state import AgentState
+    from strands.hooks import HookProvider
+    from strands.models import Model
+    from strands.session import SessionManager
+    from strands.tools import ToolProvider
+    from strands.tools.executors._executor import ToolExecutor
+    from strands.types.content import Messages
+    from strands.types.traces import AttributeValue
+
+    from ..types import ThreadContext
+    from .summarization import SummarizationStrategy
+
+
+class CodeExecutionMode(enum.StrEnum):
+    """Code-execution mode for Python tool calls."""
+
+    LOCAL = "local"
+    """Execute code in a sandboxed in-process Python executor."""
+
+    DISABLED = "disabled"
+    """No code execution — rely solely on structured output (default)."""
+
+
+class AgentKwargs(TypedDict, total=False):
+    """Kwargs pass-through for the ``strands.Agent`` constructor.
+
+    ``conversation_manager`` is accepted in this mapping but must always
+    be left unset (or explicitly ``None``) by users. The runtime manages
+    conversation history through the event log and installs
+    ``NullConversationManager`` on every ``Agent`` it builds; a
+    user-supplied manager would mutate ``agent.messages`` behind the
+    runtime's back and desynchronize it from the event log. Setting this
+    key to any non-``None`` value is rejected at config resolution with
+    ``AIFunctionError``.
+    """
+
+    messages: Messages | None
+    callback_handler: Callable[..., Any] | None  # pyright: ignore[reportExplicitAny]
+    conversation_manager: ConversationManager | None
+    record_direct_tool_call: bool
+    load_tools_from_directory: bool
+    trace_attributes: Mapping[str, AttributeValue] | None
+    agent_id: str | None
+    state: AgentState | dict[str, Any] | None  # pyright: ignore[reportExplicitAny]
+    hooks: list[HookProvider] | None
+    session_manager: SessionManager | None
+    tool_executor: ToolExecutor | None
+
+
+class ThreadKwargs(TypedDict, total=False):
+    """Kwargs mirror of ``ThreadConfig`` fields; enforced equal at module load."""
+
+    model: Model | str | None
+    system_prompt: str | None
+    tools: list[AgentTool | ToolProvider | str] | None
+    post_conditions: list[PostCondition]
+    max_attempts: int
+    structured_output: bool
+    code_execution_mode: CodeExecutionMode | str
+    code_executor_additional_imports: list[str]
+    code_executor_kwargs: dict[str, Any]
+    agent_kwargs: AgentKwargs
+    name: str | None
+    description: str | None
+    input_schema: JSONSchema | None
+    thread_name: str | None
+    config_hook: Callable[[ThreadContext], ThreadKwargs] | None
+    summarization_strategy: SummarizationStrategy | None
+    summarization_threshold: int | None
+    summarization_enabled: bool
+    coordinator_tools_enabled: bool
+
+
+class ThreadMergedKwargs(AgentKwargs, ThreadKwargs):
+    """Union of ``AgentKwargs`` and ``ThreadKwargs`` for decorator kwargs typing."""
+
+
+@dataclass(frozen=True)
+class ThreadConfig:
+    """Immutable configuration for one thread's execution.
+
+    Invariants:
+        Field names equal ``ThreadKwargs`` annotation keys (enforced at
+        module load).
+    """
+
+    model: Model | str | None = None
+    """LLM model to use for the agent."""
+    system_prompt: str | None = None
+    """System prompt for the agent."""
+    tools: tuple[AgentTool | ToolProvider | str, ...] = ()
+    """Tools provided to the agent."""
+    post_conditions: tuple[PostCondition, ...] = ()
+    """List of functions to call to validate the output."""
+    max_attempts: int = 10
+    """Maximum number of retries after the initial attempt.
+
+    A cycle makes at most ``max_attempts + 1`` agent runs: one initial try
+    plus up to ``max_attempts`` retries triggered by post-condition failures
+    or a missing result (code-execution mode). ``max_attempts=0`` disables
+    retrying entirely."""
+    structured_output: bool = True
+    """Whether to use structured output mode (agent has to call a tool to provide an answer).
+    Can be False only if the output type is `str`.
+    """
+
+    code_execution_mode: CodeExecutionMode | str = CodeExecutionMode.DISABLED
+    """Whether the agent may execute Python via a sandboxed ``python_executor`` tool.
+
+    Accepts the enum or its string value (``"local"`` / ``"disabled"``);
+    ``CodeExecutionMode`` is a ``StrEnum``, so comparisons treat them alike.
+
+    ``DISABLED`` (default): no code execution; the answer comes from structured
+    output. ``LOCAL``: a smolagents-backed AST-sandboxed executor is added to
+    the agent's tools, seeded with the cycle's bound arguments (including any
+    ``Procedural`` parameter code), and the agent may return its answer by
+    calling ``final_answer(...)`` inside executed code. Requires the optional
+    ``smolagents`` dependency (``pip install strands-ai-functions[procedural]``).
+    """
+
+    code_executor_additional_imports: list[str] = field(default_factory=list)
+    """Extra modules the ``python_executor`` sandbox may import, beyond the
+    built-in ``SAFE_BUILTINS`` allowlist (e.g. ``["sympy"]``). Only consulted
+    when ``code_execution_mode`` is ``LOCAL``."""
+
+    code_executor_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Extra keyword arguments forwarded to the underlying smolagents
+    ``LocalPythonExecutor``. Only consulted when ``code_execution_mode`` is
+    ``LOCAL``."""
+
+    agent_kwargs: AgentKwargs = field(default_factory=AgentKwargs)
+    """Extra kwargs forwarded to ``strands.Agent``."""
+
+    name: str | None = None
+    """Name used when the thread is made available as a tool."""
+    description: str | None = None
+    """Description used when the thread is made available as a tool."""
+    input_schema: JSONSchema | None = None
+    """Override the input_schema when the thread is made available as a tool."""
+
+    thread_name: str | None = None
+    """Name of the thread for visualization purposes."""
+
+    config_hook: Callable[[ThreadContext], ThreadKwargs] | None = None
+    """Optional per-cycle config patch.
+
+    Called at the start of every cycle with the current ``ThreadContext``.
+    The returned ``ThreadKwargs`` is merged into this config for that cycle
+    only — ``self`` is never mutated. Useful for injecting cycle-specific
+    tools (e.g. ``spawn_thread`` closed over the current runtime and
+    ``thread_id``) or overriding model/system_prompt per-cycle.
+
+    Merge semantics: all fields replace the base config value if present
+    in the returned dict (including ``tools``). ``config_hook`` itself is
+    excluded from the merge — returning a ``config_hook`` key from the
+    hook is a no-op. ``config_hook`` is NOT re-invoked during
+    summarization; the already-resolved cycle config is passed to the
+    strategy verbatim so a fork-based strategy can keep the cached prompt
+    prefix valid.
+
+    Concurrency:
+        Called synchronously inside ``_run_cycle``; must not block.
+    """
+
+    summarization_strategy: SummarizationStrategy | None = None
+    """Strategy that decides how to compact the history on context overflow.
+
+    ``None`` (default) uses ``DefaultSummarizationStrategy`` with its
+    own defaults (fork when compatible, preserve a bounded recent tail,
+    summarize the rest). Set to a custom implementation to override the
+    full summarization policy — model choice, framing, context
+    injection, multi-pass summarization, etc. See
+    :class:`SummarizationStrategy` for the contract.
+
+    Summarization knobs (``summarize_by_forking``, preservation bounds) are
+    parameters of the strategy itself. Configure them by constructing your own
+    :class:`DefaultSummarizationStrategy`.
+    """
+
+    summarization_threshold: int | None = None
+    """Proactively summarize when the estimated history exceeds this many tokens.
+
+    ``None`` (default) is purely reactive: history is compacted only on a
+    ``ContextWindowOverflowException``. When set, the runtime compacts at cycle
+    entry before the model call. Keep it above the strategy's preserved tail
+    (``DefaultSummarizationStrategy.preserve_max_tokens``) so it converges.
+
+    Ignored when ``summarization_enabled`` is ``False``."""
+
+    summarization_enabled: bool = True
+    """Master switch for all context management on this thread.
+
+    ``True`` (default): the runtime compacts history via the configured
+    ``summarization_strategy`` — proactively when ``summarization_threshold``
+    is crossed, and reactively on a ``ContextWindowOverflowException``.
+
+    ``False``: no compaction ever runs. The proactive threshold check is
+    skipped and a ``ContextWindowOverflowException`` propagates unchanged
+    instead of triggering summarization — the thread fails loudly rather than
+    silently rewriting its own history. Two uses:
+
+    - Callers who would rather surface an overflow than have history compacted.
+    - The summarizer helper threads themselves: every summarizer template sets
+      this ``False`` so a summarization cycle can never recursively spawn
+      another summarizer (which would be unbounded)."""
+
+    coordinator_tools_enabled: bool = True
+    """Auto-inject the coordinator tools (``list_threads`` / ``send_message``).
+    Set ``False`` for a single-purpose agent that should not talk to peers."""
+
+
+def _check_config_fields_match_kwargs() -> None:
+    config_fields = {f.name for f in dataclasses.fields(ThreadConfig)}
+    kwargs_fields = set(ThreadKwargs.__annotations__.keys())
+    if config_fields != kwargs_fields:
+        missing = kwargs_fields - config_fields
+        extra = config_fields - kwargs_fields
+        raise TypeError(
+            "ThreadConfig fields must exactly match ThreadKwargs. "
+            f"missing from config: {missing}, extra on config: {extra}"
+        )
+
+
+_check_config_fields_match_kwargs()
+
+
+def split_config_and_agent_kwargs(
+    **kwargs: Unpack[ThreadMergedKwargs],
+) -> tuple[ThreadKwargs, AgentKwargs]:
+    """Partition merged kwargs into ``ThreadConfig`` fields and ``Agent`` kwargs.
+
+    Args:
+        kwargs: Keys drawn from ``ThreadMergedKwargs``.
+
+    Returns:
+        ``(thread_kwargs, agent_kwargs)`` disjoint on keys, union equal
+        to ``kwargs``.
+
+    Ensures:
+        - ``thread_kwargs`` keys are a subset of ``ThreadConfig`` field names.
+        - ``agent_kwargs`` keys are disjoint from ``ThreadConfig`` field names.
+    """
+    config_field_names = frozenset(f.name for f in dataclasses.fields(ThreadConfig))
+    config_kwargs = {k: v for k, v in kwargs.items() if k in config_field_names}
+    agent_kwargs = {k: v for k, v in kwargs.items() if k not in config_field_names}
+    return (
+        ThreadKwargs(**config_kwargs),  # type: ignore[typeddict-item]  # pyright: ignore[reportArgumentType]
+        AgentKwargs(**agent_kwargs),  # type: ignore[typeddict-item]  # pyright: ignore[reportArgumentType]
+    )

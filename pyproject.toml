@@ -7,7 +7,7 @@ name = "strands-ai-functions"
 dynamic = ["version"]
 description = "AI Function decorator for enhancing functions with AI capabilities"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "AWS", email = "opensource@amazon.com"},
@@ -17,7 +17,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -28,27 +27,43 @@ classifiers = [
 dependencies = [
     "strands-agents>=1.16.0",
     "pydantic>=2.4.0,<3.0.0",
-    "smolagents>=1.24.0",
     "tstr>=0.4.0.post1",
+    # The CLI (`ai-functions`) is built on the network layer and the
+    # Typer/Rich/Textual stack, so these are runtime requirements.
+    "websockets>=12.0",
+    "cloudpickle>=3.0.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.70",
+    "platformdirs>=4.0",
+    # Memory/optimizer rendering serializes parameter values to YAML.
+    "pyyaml>=6.0",
+    "smolagents>=1.24.0",
     "rank-bm25>=0.2.2",
-    "tinydb>=4.8.2",
+]
+
+[project.optional-dependencies]
+network = [
+    "websockets>=12.0",
+    "cloudpickle>=3.0.0",
+]
+claude-code = [
+    "claude-agent-sdk>=0.1.66",
+]
+kiro = [
+    "agent-client-protocol==0.10.1",
+]
+agentcore = [
     "bedrock-agentcore>=1.6.0",
 ]
 
+[project.scripts]
+ai-functions = "ai_functions.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/strands-labs/ai-functions"
-Documentation = "https://github.com/strands-labs/ai-functions#readme"
 Repository = "https://github.com/strands-labs/ai-functions.git"
 Issues = "https://github.com/strands-labs/ai-functions/issues"
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21.0",
-    "hypothesis>=6.0",
-    "mypy>=1.0",
-    "ruff>=0.1.0",
-]
 
 [tool.hatch.version]
 source = "vcs"
@@ -57,13 +72,30 @@ source = "vcs"
 packages = ["src/ai_functions"]
 
 [tool.hatch.envs.default]
+python = "3.12"
 dependencies = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0",
     "hypothesis>=6.0",
-    "mypy>=1.0",
     "ruff>=0.1.0",
+    "mypy>=1.20.0",
+    "websockets>=12.0",
+    "cloudpickle>=3.0.0",
+    "claude-agent-sdk>=0.1.66",
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.70",
+    "platformdirs>=4.0",
+    "agent-client-protocol==0.10.1",
+    "pyyaml>=6.0",
+    "bedrock-agentcore>=1.6.0",
+    "rank-bm25>=0.2.2",
+    "smolagents>=1.24.0",
+    "strands-agents-tools>=0.8.2",
+    "scipy>=1.11",
+    "yfinance>=0.2.40",
+    "plotly>=5.20",
 ]
 
 [tool.hatch.envs.default.scripts]
@@ -71,12 +103,18 @@ test = "pytest {args:tests}"
 test-cov = "pytest --cov=ai_functions {args:tests}"
 lint = "ruff check src tests"
 format = "ruff format src tests"
-typecheck = "mypy src"
+check-spec = "MYPYPATH=spec stubtest ai_functions --mypy-config-file pyproject.toml --allowlist stubtest-allowlist.txt"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Examples import sibling helpers (e.g. ``_utils``); tests that load an example
+# by file path need ``examples/`` importable as a top-level location.
+pythonpath = ["examples"]
 python_files = ["test_*.py", "*_test.py"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore:websockets\\.legacy is deprecated:DeprecationWarning:websockets.legacy",
+]
 
 [tool.ruff]
 line-length = 120
@@ -84,31 +122,35 @@ include = ["examples/**/*.py", "src/**/*.py", "tests/**/*.py"]
 
 [tool.ruff.lint]
 select = ["B", "D", "E", "F", "I", "UP", "W"]
+ignore = ["D107"]
 
 [tool.ruff.lint.per-file-ignores]
-"!src/**/*.py" = ["D"]
-# @ai_function docstrings serve as LLM prompts — exempt from docstring formatting rules
-"src/ai_functions/memory/json_backend.py" = ["D205", "D415"]
-"src/ai_functions/optimizer/textgrad.py" = ["D205"]
+"tests/**/*.py" = ["D"]
+"examples/**/*.py" = ["D"]
+# Verbatim DS-1000 problem data: long embedded prompt/test strings can't wrap.
+"examples/_ds1000_scipy.py" = ["D", "E501"]
+"src/ai_functions/network/client.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/endpoint.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/channel.py" = ["D101", "D102", "D105"]
+"src/ai_functions/network/wire_methods.py" = ["D101"]
+# The gradient-feedback models and rendering helpers are below the public
+# surface (the spec documents build_graph + TextGradOptimizer only).
+"src/ai_functions/optimizer/textgrad.py" = ["D101"]
+"src/ai_functions/optimizer/rendering.py" = ["D103"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.mypy]
 python_version = "3.12"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-follow_untyped_imports = true
-ignore_missing_imports = false
+ignore_errors = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
 
 [tool.uv.workspace]
 members = ["examples"]

@@ -62,9 +62,11 @@ This project uses [hatchling](https://hatch.pypa.io/latest/build/#hatchling) as 
    hatch shell
    ```
 
-   Alternatively, install in development mode:
+   Alternatively, install in development mode (the dev dependencies live in
+   the Hatch default environment; ``hatch shell`` above is the recommended
+   path):
    ```bash
-   pip install -e ".[dev]"
+   pip install -e .
    ```
 
 4. Set up pre-commit hooks (if available):
@@ -93,7 +95,7 @@ pytest tests/
 
 We use the following tools to ensure code quality:
 1. **ruff** - For formatting and linting
-2. **mypy** - For static type checking
+2. **stubtest** - For verifying the `spec/` type stubs against the runtime
 3. **pytest** - For unit and integration tests
 4. **hypothesis** - For property-based testing
 
@@ -106,11 +108,11 @@ hatch run format
 # Run linter
 hatch run lint
 
-# Run type checker
-hatch run typecheck
+# Verify the type stubs match the runtime
+hatch run check-spec
 
 # Run all checks together
-hatch run format && hatch run lint && hatch run typecheck && hatch run test
+hatch run format && hatch run lint && hatch run check-spec && hatch run test
 ```
 
 ### Code Formatting and Style Guidelines
@@ -165,7 +167,7 @@ To send us a pull request, please:
    ```bash
    hatch run format      # Format your code
    hatch run lint        # Check linting
-   hatch run typecheck   # Check types
+   hatch run check-spec  # Verify type stubs
    hatch run test        # Run tests
    ```
 
@@ -196,7 +198,7 @@ Before submitting your pull request, verify:
 - [ ] All tests pass (`hatch run test`)
 - [ ] Code is properly formatted (`hatch run format`)
 - [ ] No linting errors (`hatch run lint`)
-- [ ] Type checking passes (`hatch run typecheck`)
+- [ ] Type stubs verified (`hatch run check-spec`)
 - [ ] New functionality includes tests
 - [ ] Documentation has been updated if needed
 - [ ] Commit messages are clear and descriptive
@@ -218,7 +220,7 @@ Before submitting your pull request, verify:
 ```python
 import pytest
 from ai_functions import ai_function
-from ai_functions.types import PostConditionResult
+from ai_functions.ai_thread import PostConditionResult
 
 
 class TestAIFunction:
@@ -243,7 +245,7 @@ class TestAIFunction:
             """Check that text is at least 10 characters."""
             return PostConditionResult(
                 passed=len(text) >= 10,
-                reason="Text must be at least 10 characters"
+                message="Text must be at least 10 characters"
             )
 
         @ai_function(post_conditions=[validate_length])

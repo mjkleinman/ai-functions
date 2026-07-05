@@ -1,39 +1,38 @@
-"""Memory optimization example using AgentCore backend.
+"""Memory + optimizer with the AWS Bedrock AgentCore backend.
 
-This example demonstrates how to use TextGradOptimizer with AgentCoreMemoryBackend
-to automatically improve memory parameters based on feedback.
+Same self-improving joke -> email flow as ``memory_optimization.py``, but
+parameters live in an AgentCore Memory resource instead of a JSON file. The
+workflow is identical — ``recall`` + ``trace`` wire the graph, ``step`` runs
+backward and consolidation — only the backend changes.
 
-NOTE: Requires AWS credentials with Bedrock permissions.
-Set AWS_REGION environment variable if not using us-east-1.
+AgentCore consolidation differs from the JSON backend: rather than running an
+explicit merge AI function, ``consolidate`` appends feedback as conversation
+turns, which AgentCore's semantic-memory strategy extracts into long-term
+memory **asynchronously**. Short-term memory reflects the turns immediately;
+long-term records appear after a delay.
+
+Requires AWS credentials with Bedrock AgentCore permissions and the optional
+dependency:  ``pip install strands-ai-functions[agentcore]``.
+Set AWS_REGION if you are not using us-east-1.
 """
 
+import asyncio
 import os
 import uuid
-import boto3
+
+from _utils import display, rule
 from pydantic import BaseModel, Field
 
-from ai_functions import ai_function
-from ai_functions.types.graph import Result
-from ai_functions.utils import show_graph, bullet_points, get_console
-from ai_functions.optimizer.textgrad import TextGradOptimizer
-from ai_functions.memory import AgentCoreMemoryBackend
+from ai_functions import AgentCoreMemoryBackend, TextGradOptimizer, ai_function
 
-from utils import display, wait_for_ltm_update
+model = None  # use the default model
+region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
 
-model = None  # use default model
 
-current_region = (
-    boto3.session.Session().region_name
-    or os.getenv("AWS_REGION")
-    or os.getenv("AWS_DEFAULT_REGION")
-    or "us-east-1"
-)
-
-@ai_function(model=model, callback_handler=None)
+@ai_function(model=model)
 def joke_writer(topic: str, joke_guidelines: str) -> str:
     """
     Write a joke about the following topic: "{topic}".
-
     Use the following guidelines:
     <joke_guidelines>
     {joke_guidelines}
@@ -41,83 +40,115 @@ def joke_writer(topic: str, joke_guidelines: str) -> str:
     """
 
 
-@ai_function(model=model, callback_handler=None)
-def email_writer(jokes: list[str], formatting_guidelines: str) -> str:
+@ai_function(model=model)
+def email_writer(joke_1: str, joke_2: str, formatting_guidelines: str) -> str:
     """
-     Write an email to Jane Doe containing the following jokes:
-     {bullet_points(jokes)}
-
-     Use the following email formatting guidelines:
-     <formatting_guidelines>
-     {formatting_guidelines}
-     </formatting_guidelines>
-     """
-
-
-class Schema(BaseModel):
-    joke_guidelines: str = Field("No specific guidelines yet.", description="Guidelines to write a good joke")
-    formatting_guidelines: str = Field("No specific guidelines yet.",
-                                      description="Guidelines for the layout and typography of the email.")
+    Write an email to Jane Doe containing the following jokes:
+    Joke 1: {joke_1}
+    Joke 2: {joke_2}
+    Use the following email formatting guidelines:
+    <formatting_guidelines>
+    {formatting_guidelines}
+    </formatting_guidelines>
+    """
 
 
-def main():
-    # Create AgentCore memory backend (automatically gets/creates memory by name)
-    memory = AgentCoreMemoryBackend(
-        Schema,
-        f"ai_functions_test_{uuid.uuid4()}",
-        memory_name="ai_function_backprop_test",
-        region_name=current_region
+class WritingMemory(BaseModel):
+    joke_guidelines: str = Field(
+        "No specific guidelines yet.",
+        description="Guidelines to write a good joke",
     )
-    optimizer = TextGradOptimizer(model=model, quiet=True)
+    formatting_guidelines: str = Field(
+        "No specific guidelines yet.",
+        description="Guidelines for the layout and typography of the email.",
+    )
 
-    display("Initial Memory", str(memory), lang="yaml")
 
-    # To optimize memory, we need to track the graph of all function calls and memory parameter used
-    # Using .invoke(...) automatically adds the necessary tracking information to the result
-    cat_joke = joke_writer.trace('a joke about cats', joke_guidelines=memory.recall('joke_guidelines'))
-    programmer_joke = joke_writer.trace('a joke about programmers', joke_guidelines=memory.recall('joke_guidelines'))
-    result: Result[str] = email_writer.trace([cat_joke, programmer_joke],
-                                              formatting_guidelines=memory.recall('formatting_guidelines'))
+async def wait_for_ltm_update(
+    memory: AgentCoreMemoryBackend,
+    max_wait: int = 180,
+    poll_interval: int = 10,
+) -> bool:
+    """Poll AgentCore until new LTM records appear after consolidation.
 
-    # `result` contains the representation of the entire graph leading to it. To extract the actual output we use .value
-    display("Email Written", result.value, lang="markdown")
+    ``record_counts()`` returns ``(stm_count, ltm_count)``; semantic extraction
+    runs asynchronously, so the long-term count only rises some time after the
+    consolidation turns are appended. Returns True once it does, or False on
+    timeout.
+    """
+    _, initial_ltm = memory.record_counts()
+    elapsed = 0
+    while elapsed < max_wait:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        _, current_ltm = memory.record_counts()
+        if current_ltm > initial_ltm:
+            display("LTM Update", f"Updated after {elapsed}s ({initial_ltm} -> {current_ltm} records).")
+            return True
+    display("LTM Update", f"Timed out after {max_wait}s waiting for LTM consolidation.")
+    return False
 
-    # We can now use feedback to optimize the memory, adjusting to user preferences or preventing errors
+
+async def main() -> None:
+    # Get-or-create an AgentCore memory resource by name; namespaced per actor.
+    memory = AgentCoreMemoryBackend(
+        WritingMemory,
+        actor_id=f"writer-{uuid.uuid4()}",
+        memory_name="ai_function_backprop_test",
+        region_name=region,
+        model=model,
+    )
+    optimizer = TextGradOptimizer(model=model)
+
+    display("Initial Memory", str(memory))
+
+    # Forward pass: trace() records which recalled parameters and prior results
+    # each run consumed — passing them as arguments wires the graph.
+    cat_joke = await joke_writer.trace(
+        topic="cats",
+        joke_guidelines=await memory.recall("joke_guidelines"),
+    )
+    display("Cat Joke", str(cat_joke))
+
+    prog_joke = await joke_writer.trace(
+        topic="programmers",
+        joke_guidelines=await memory.recall("joke_guidelines"),
+    )
+    display("Programmer Joke", str(prog_joke))
+
+    email = await email_writer.trace(
+        joke_1=cat_joke,
+        joke_2=prog_joke,
+        formatting_guidelines=await memory.recall("formatting_guidelines"),
+    )
+    display("Email", str(email))
+
+    # Optimize: build graph + backward + consolidate, in one call.
     feedback = (
         "Jokes about cats should always be about Siamese cats. "
         "Jokes about programmers should be about coffee. "
-        "The email should include a title for each joke. "
+        "The email should include a title for each joke."
     )
+    display("Feedback", feedback)
 
-    display("Feedback", feedback, lang="text")
+    rule("Running optimizer step (consolidation appends turns; LTM extraction is async)")
+    await optimizer.step(email, feedback, backends=[memory])
 
-    # First, we need to propagate the feedback through the graph to determine which functions is responsible for what
-    # issue and which parameters need to be updated
-    with get_console().status("Propagating feedback..."):
-        optimizer.backward(result, feedback)
+    # Short-term memory reflects the new turns immediately.
+    display("Current Memory (STM)", str(memory))
 
-    # We can now visualize the entire agent and parameter graph and see how the feedback has been propagated
-    show_graph(result, open_browser=True)
+    # Long-term memory catches up asynchronously as AgentCore's semantic
+    # strategy extracts the appended turns — poll until those records appear.
+    rule("Waiting for LTM consolidation")
+    await wait_for_ltm_update(memory)
 
-    # Finally, we consolidate the feedback propagated to each parameter, and commit the new value to memory
-    # Note: AgentCore consolidation adds feedback as conversation turns, which AgentCore's semantic
-    # memory extractor will process asynchronously and consolidate into long-term memory
-    with get_console().status("Consolidating memory..."):
-        optimizer.consolidate(result)
+    display("Current Memory (LTM)", str(memory))
 
-    # Short term memory updates immediately, while long term memory updates asynchronously
-    display("Current Memory (STM)", str(memory), lang="yaml")
-
-    # Poll for LTM consolidation — waits until new long-term memory records appear
-    wait_for_ltm_update(memory)
-
-    # Display consolidated long-term memory
-    display("Current Memory (LTM)", str(memory), lang="yaml")
-
+    # Tidy up the test memory resource. Drop these two lines to inspect LTM
+    # in the AgentCore console once semantic extraction has run.
     memory.delete_all(wait=False)
-
     memory.close()
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())

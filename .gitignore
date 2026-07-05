@@ -1,4 +1,5 @@
 .idea/
+.claude/
 
 *.pyc
 __pycache__/
@@ -7,11 +8,19 @@ dist/
 uv.lock
 .mypy_cache/
 .ruff_cache/
-
+.venv/
 
 # MkDocs
 site/
 .cache/
 
+# screenshot generation scratch
+.screenshots/
+.DS_Store
+
 # example output
 examples/*.html
+examples/data/
+examples/*.egg-info/
+examples/multiagent_report.md
+examples/stock_report.html

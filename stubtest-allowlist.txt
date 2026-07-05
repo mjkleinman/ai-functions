@@ -1,0 +1,79 @@
+# PEP 695 generics create __type_params__ at runtime; not representable in stubs
+ai_functions.ai_thread.ai_function.AIFunction.__type_params__
+ai_functions.ai_thread.ai_function._TypedDecorator.__type_params__
+ai_functions.ai_thread.ai_thread.AIThread.__type_params__
+ai_functions.ai_thread.ai_thread.OutputSpec.__type_params__
+ai_functions.handle.ThreadHandle.__type_params__
+ai_functions.runtime.worker.PromptRequest.__type_params__
+ai_functions.protocols.Spawnable.__type_params__
+ai_functions.protocols.Thread.__type_params__
+ai_functions.types.graph.ParameterView.__type_params__
+ai_functions.types.graph.Result.__type_params__
+
+# ai_function is an optional-first-argument decorator factory: it can be
+# applied bare (@ai_function[T]) or called with config (@ai_function[T](...)),
+# so the runtime __call__ must accept prompt_fn as an optional first
+# positional. stubtest synthesises its comparison signature from the
+# overloads (where prompt_fn is required) and flags the mandatory runtime
+# ``= None`` default. The overloads describe the true API; the runtime
+# default is a false positive of that synthesis.
+ai_functions.ai_thread.ai_function._TypedDecorator.__call__
+ai_functions.ai_thread.ai_function._AIFunctionFactory.__call__
+
+# Annotated[Union[...], Field(...)] aliases are callable _AnnotatedAlias at runtime, not Union types.
+# On Python 3.12, stubtest resolves an ``Annotated[str/bytes, ...]`` alias to its underlying
+# builtin class and flags every inherited method (``zfill``, ``upper``, ``__add__`` …) as absent;
+# the ``.*`` suffix suppresses that per-method noise for the str/bytes-backed aliases.
+ai_functions.network.wire.Binary
+ai_functions.network.wire.Binary.*
+ai_functions.network.wire.Frame
+ai_functions.types.events.SystemEvent
+ai_functions.types.policy.Policy
+ai_functions.memory.frozen.Frozen
+ai_functions.memory.procedural.Procedural
+ai_functions.memory.procedural.Procedural.*
+
+# PEP 695 ``type`` alias: ``type Traceable[T] = T | ParameterView[T] | Result[T]``. The stub
+# declares it identically, but stubtest cannot represent a TypeAliasType as a Union and flags it.
+ai_functions.types.graph.Traceable
+
+# NewType creates functions at runtime; stubs declare them as classes (TypeInfo)
+ai_functions.types.ids.EventId
+ai_functions.types.ids.MessageId
+ai_functions.types.ids.ThreadId
+ai_functions.types.ids.WorkerId
+
+# pydantic mangles __context in model_post_init; not our concern
+ai_functions.ai_thread.postcondition.PostConditionResult.model_post_init
+
+# CoordinatorHandlers / WorkerHandlers are dispatch tables for the wire
+# layer. Each public method is a @rpc_method-decorated handler; the stub
+# declares only the class signatures (the methods are internal machinery
+# discovered by bind_handlers via introspection, not a user-facing API).
+ai_functions.network.client.WorkerHandlers.*
+ai_functions.network.endpoint.CoordinatorHandlers.*
+
+# wire_methods.py is a collection of per-RPC pydantic request models.
+# Their shapes are implementation details of the wire protocol; the spec
+# documents the RPC surface in channel.pyi / client.pyi / endpoint.pyi
+# rather than duplicating every params model in a stub file.
+ai_functions.network.wire_methods
+
+# Optimizer internals: rendering helpers, the backward AI function's
+# gradient-feedback pydantic models, and the module logger are
+# implementation details below the public surface (build_graph +
+# TextGradOptimizer). The spec documents only the public API.
+ai_functions.optimizer.rendering
+ai_functions.optimizer.textgrad.Feedback
+ai_functions.optimizer.textgrad.Feedbacks
+ai_functions.optimizer.textgrad.logger
+
+# Memory backend module loggers are internal implementation detail.
+ai_functions.memory.agentcore_backend.logger
+ai_functions.memory.base.logger
+
+# debug.py is an opt-in console dump of the exact per-model-call request,
+# gated on the AI_FUNCTIONS_SHOW_PROMPTS env var and imported lazily inside
+# AIThread._build_agent. It is a diagnostics helper below the public surface
+# (exported nowhere, no external consumers), so the spec does not stub it.
+ai_functions.ai_thread.debug
