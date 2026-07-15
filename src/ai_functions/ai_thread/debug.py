@@ -84,3 +84,24 @@ def print_model_request(agent: Agent, *, printed_upto: int, call_index: int, thr
             print(_render_block(cast("dict[str, object]", raw_block)), file=out)
     print(_RULE, file=out)
     return len(messages)
+
+
+def print_model_response(content: list[object], *, thread_name: str, call_index: int) -> None:
+    """Print the assistant turn a model call just produced.
+
+    The response-side counterpart of :func:`print_model_request`, called by the
+    event bridge after each model call with the completed turn's content
+    blocks. Tool calls render compactly (as in requests); the next request dump
+    does not repeat this turn — it prints only the messages appended after it.
+
+    Args:
+        content: The assistant message's content blocks.
+        thread_name: Label for the header.
+        call_index: 1-based model-call counter within this agent build.
+    """
+    out = sys.stderr
+    print(f"MODEL RESPONSE · {thread_name} · call #{call_index}", file=out)
+    for raw_block in content:
+        if isinstance(raw_block, dict):
+            print(_render_block(cast("dict[str, object]", raw_block)), file=out)
+    print(_RULE, file=out)

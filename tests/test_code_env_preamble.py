@@ -29,11 +29,7 @@ _HAS_SMOLAGENTS = importlib.util.find_spec("smolagents") is not None
 
 def test_procedural_signatures_captures_signature_docstring_and_return() -> None:
     """Each block is the def line (with return annotation) plus the docstring."""
-    code = (
-        "def greet(name: str) -> str:\n"
-        '    """Say hello to someone by name."""\n'
-        "    return f'hi {name}'\n"
-    )
+    code = 'def greet(name: str) -> str:\n    """Say hello to someone by name."""\n    return f\'hi {name}\'\n'
     (block,) = procedural_signatures(code)
     assert block == 'def greet(name: str) -> str:\n    """Say hello to someone by name."""'
 
@@ -144,11 +140,7 @@ async def test_preamble_with_docstring_appears_in_message_user_event() -> None:
         )
         handle = await h.spawn(run_task.replace(model=model), thread_name="run_task")
         await handle.run(
-            helpers=(
-                "def greet(name):\n"
-                '    """Greet a person warmly by name."""\n'
-                "    return f'hello {name}'\n"
-            )
+            helpers=('def greet(name):\n    """Greet a person warmly by name."""\n    return f\'hello {name}\'\n')
         )
 
         user_events = [

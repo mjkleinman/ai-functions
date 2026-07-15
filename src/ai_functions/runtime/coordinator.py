@@ -229,6 +229,12 @@ class InMemoryCoordinator(Coordinator):
             adapter = next(iter(self._workers.values()))
 
         tid = thread_id if thread_id is not None else ThreadId(f"thread-{uuid.uuid4().hex[:12]}")
+        if thread_name is None:
+            # Default the display name from the spawnable so event logs (and
+            # the optimization graphs reconstructed from them) carry the
+            # function's name without every caller having to pass it.
+            name = getattr(target, "name", None)
+            thread_name = name if isinstance(name, str) and name else None
 
         # Seed the log BEFORE registering the thread, so external
         # observers never see a registered-but-empty-log window.

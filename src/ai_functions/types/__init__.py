@@ -36,9 +36,10 @@ from .events import (
     TokenUsageEvent,
     ToolCallEvent,
     ToolResultEvent,
+    TraceDelegationEvent,
     is_renderable_event,
 )
-from .graph import ParameterView, Result, Traceable, collect_nodes, unwrap_nodes
+from .graph import GradFeedback, ParameterHost, ParameterView, Result, Traceable, collect_nodes, unwrap_nodes
 from .ids import EventId, MessageId, ThreadId, WorkerId
 from .policy import Policy
 from .status import InputShape, ThreadInfo, ThreadStatus
@@ -55,6 +56,7 @@ __all__ = [
     "EventId",
     "EventKind",
     "FailedEvent",
+    "GradFeedback",
     "InputShape",
     "MessageAssistantCompleteEvent",
     "MessageAssistantStartEvent",
@@ -62,6 +64,7 @@ __all__ = [
     "MessageAssistantTokenEvent",
     "MessageId",
     "MessageUserEvent",
+    "ParameterHost",
     "ParameterRecalledEvent",
     "ParameterView",
     "Policy",
@@ -81,6 +84,7 @@ __all__ = [
     "TokenUsageEvent",
     "ToolCallEvent",
     "ToolResultEvent",
+    "TraceDelegationEvent",
     "Traceable",
     "WorkerId",
     "collect_nodes",

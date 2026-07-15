@@ -21,6 +21,7 @@ Because AI Functions *are* functions, developers can construct agentic workflows
 - [Teams of agents: the coordinator and workers](#teams-of-agents-the-coordinator-and-workers)
 - [Events and observability](#events-and-observability)
 - [Memory and optimization](#memory-and-optimization)
+- [Economics-aware execution](#economics-aware-execution)
 - [Distributed operation](#distributed-operation)
 - [Running agents across processes](#running-agents-across-processes)
 - [Going further](#going-further)
@@ -1058,6 +1059,31 @@ def travel_assistant(request: str) -> str:
 ```
 
 `tool_provider` generates schema-scoped tools (`recall_<name>`, `query_<name>`, `search_<name>` for lists, and `save_<name>` / `delete_<name>` for scalars). You can restrict which operations are available: for example, `memory.tool_provider(..., operations={"recall", "search", "query"})` provides read-only access. See `examples/memory_tools.py` for a complete example.
+
+## Economics-aware execution
+
+Post-conditions give an AI Function correctness semantics; the `ai_functions.experimental.economics` module adds the economics: what a result is worth in dollars, what each candidate model's tokens cost, and therefore which model to try, whether to switch after a failure, and when to stop. One rule governs every attempt — **an attempt is worth making only when it's expected to yield more than it cost** — and the search policy picks among the worthwhile attempts.
+
+```python
+from ai_functions.experimental.economics import PricedModel, Prices, routed
+
+HAIKU = PricedModel(model="global.anthropic.claude-haiku-4-5-20251001-v1:0",
+                    prices=Prices(input=1.00, output=5.00))
+SONNET = PricedModel(model="global.anthropic.claude-sonnet-4-6",
+                     prices=Prices(input=3.00, output=15.00))
+
+
+# A solved instance is worth 50 cents. Each call tries the most profitable
+# candidate and abstains when no attempt is worth its cost.
+@routed(models=[HAIKU, SONNET], value=0.50)
+@ai_function(post_conditions=[check_sat])
+def solve(clauses: str, n_vars: int) -> Assignment:
+    """Find a satisfying assignment ..."""
+```
+
+The decorated function is called like any other AI Function. A second decorator, `@economic`, covers graded tasks where results are worth different amounts (`value` becomes a function of the result) and sampling continues while another attempt is expected to add more worth than it costs.
+
+The module is experimental — the API may change in future releases. See [Economics-aware Execution](economics.md) for the full picture: the two decorators, search policies, and learned/custom beliefs.
 
 ## Distributed operation
 

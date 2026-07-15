@@ -27,7 +27,7 @@ model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 # No Pydantic model or JSON schema needed — the type annotation is the schema.
 
 
-@ai_function(model=model)
+@ai_function[Literal["positive", "negative", "neutral"]](model=model)
 def classify_sentiment(review: str) -> Literal["positive", "negative", "neutral"]:
     """
     Classify the sentiment of the following customer review.
@@ -48,7 +48,7 @@ def check_uppercase(summary: str) -> PostConditionResult:
     return PostConditionResult(passed=True)
 
 
-@ai_function(model=model, post_conditions=[check_uppercase], max_attempts=3)
+@ai_function[str](model=model, post_conditions=[check_uppercase], max_attempts=3)
 def summarize_review(review: str) -> str:
     """
     Summarize the following customer review in one sentence, written in ALL CAPS.

@@ -209,3 +209,75 @@ futures with the root exception (or a clear surrogate like
 Classes that must agree: every `Coordinator` implementation,
 `CoordinatorClient`, `CoordinatorEndpoint`, every `Worker`
 implementation, and every `WorkerAdapter` shim.
+
+# Economics invariants (E-series)
+
+Invariants of the `ai_functions.economics` module. Same contract as
+above, scoped to the economics layer; each is also stated inline in
+the docstring of the module that enforces it.
+
+## E1 — Dollars are the only unit
+
+Rewards, costs, budgets, and reservation prices are all dollars. Any
+layer that introduces a second unit (scores, token counts,
+probabilities) must convert at its own boundary. `value` is the only
+place task success is priced; post-conditions are never a reward
+definition, only the local booking signal (E2 settles them later).
+Violating this reintroduces an implicit exchange rate between layers,
+silently miscalibrating the stopping rule.
+
+Classes that must agree: `Prices`, every `Beliefs` implementation,
+`Estimate` and every `RewardDistribution`, `Search` and every
+`Policy`, and `EconomicFunction` (which owns `value`).
+
+## E2 — Attempt records are revisable
+
+An `AttemptRecord` is booked provisionally: `local_score` is booked
+at run time from the candidate's own post-conditions, and
+`settled_score` may later overwrite its meaning when downstream
+feedback arrives. Consumers must treat `settled_score` as
+authoritative when present. Learners store per-record contributions
+(or sufficient statistics keyed by record id) such that `settle`
+replaces a record's effect rather than double-counting it. Violating
+this corrupts learned state on settlement, and repeated backward
+passes compound the error.
+
+Classes that must agree: every `Beliefs` implementation
+(`update`/`settle`), every `AttemptRecord` consumer, and the
+settlement path from the optimizer's backward pass.
+
+## E3 — `Search` is deterministic and synchronous
+
+Identical construction and an identical observe-sequence yield
+identical decisions: no randomness, no hidden state, no async
+anywhere in the search core. Violating this breaks
+`blocked_by_budget()`'s counterfactual re-ask of the same policy and
+makes the `DECISION_EVENT` trail unreproducible.
+
+Classes that must agree: `Search`, every `Policy` implementation, and
+every `RewardDistribution.reservation_price` implementation.
+
+## E4 — Estimates are total
+
+`Beliefs.estimate` must return an estimate for every candidate it is
+given; a missing label is an error, never silently defaulted.
+Violating this lets a fabricated estimate compete in the ranking, so
+routing quietly degrades instead of erroring.
+
+Classes that must agree: every `Beliefs` implementation and
+`EconomicThread._estimate` (which enforces it after every estimation
+round).
+
+## E5 — Never knowingly spend more than expected reward
+
+When no candidate has positive net value at decision time, the
+economic function abstains rather than running the least-bad one
+(`Abstained`, or `Decision.candidate is None` from `plan()`). The
+same floor applies at every round: escalation stops when the best
+remaining candidate is no longer worth its cost. Violating this
+means a router that cannot say "not worth it" silently overpays on
+hopeless tasks.
+
+Classes that must agree: every value-ranking `Policy`
+(`ReservationPricePolicy`, `Greedy`), `EconomicThread.execute`
+(which raises the typed failure), and `EconomicFunction.plan`.

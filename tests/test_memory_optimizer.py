@@ -40,7 +40,7 @@ from ai_functions.types.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
-from ai_functions.types.graph import ParameterNode, ThreadNode
+from ai_functions.types.graph import GradFeedback, ParameterNode, ThreadNode
 
 
 @tool(context=True)
@@ -206,7 +206,7 @@ def test_consolidate_rejects_non_string_list(tmp_path: Path) -> None:
     mem = JSONMemoryBackend(_ModelListSchema, actor_id="m1", path=tmp_path / "m.json")
     mem.save("items", [_DocItem(id=1, text="a")])
     with pytest.raises(NotImplementedError, match="non-string list"):
-        mem._consolidate("items", ["feedback"])  # noqa: SLF001
+        mem._consolidate("items", [GradFeedback(text="feedback")])  # noqa: SLF001
 
 
 def test_deserialize_value_symmetric_for_nested_models(tmp_path: Path) -> None:
@@ -695,8 +695,8 @@ class _RecordingBackend(MemoryBackend):
     def _search(self, name: str, query: str, k: int = 5, **kwargs: object) -> object:
         return []
 
-    def _consolidate(self, name: str, feedback: list[str], **kwargs: object) -> None:
-        self.calls.append((name, feedback))
+    def _consolidate(self, name: str, feedback: list[GradFeedback], **kwargs: object) -> None:
+        self.calls.append((name, [g.text for g in feedback]))
 
     def _delete(self, name: str) -> None: ...
 
@@ -707,8 +707,12 @@ def test_consolidate_groups_by_backend_and_name() -> None:
     optimizer = TextGradOptimizer()
 
     # Same parameter referenced from two nodes (root + child) with gradients.
-    p_root = ParameterNode(node_id="r-p", name="joke_guidelines", backend=backend, gradients=["fb-a"])
-    p_child = ParameterNode(node_id="c-p", name="joke_guidelines", backend=backend, gradients=["fb-b"])
+    p_root = ParameterNode(
+        node_id="r-p", name="joke_guidelines", backend=backend, gradients=[GradFeedback(text="fb-a")]
+    )
+    p_child = ParameterNode(
+        node_id="c-p", name="joke_guidelines", backend=backend, gradients=[GradFeedback(text="fb-b")]
+    )
     root = ThreadNode(node_id="root", thread_id="root", parameters=[p_root])
     child = ThreadNode(node_id="c", thread_id="c", parameters=[p_child])
     root.child_threads = [child]
@@ -737,8 +741,8 @@ def test_zero_grad_clears_all_gradients() -> None:
     """zero_grad empties node and parameter gradients across the graph."""
     backend = _RecordingBackend(WritingMemory, "w1")
     optimizer = TextGradOptimizer()
-    p = ParameterNode(node_id="p", name="joke_guidelines", backend=backend, gradients=["x"])
-    root = ThreadNode(node_id="root", thread_id="root", parameters=[p], gradients=["y"])
+    p = ParameterNode(node_id="p", name="joke_guidelines", backend=backend, gradients=[GradFeedback(text="x")])
+    root = ThreadNode(node_id="root", thread_id="root", parameters=[p], gradients=[GradFeedback(text="y")])
 
     optimizer.zero_grad(root)
 
@@ -1461,7 +1465,9 @@ class _RouteToIdFn:
         rendered = yaml.safe_load(inputs) or {}
         self.seen_inputs.append(rendered)
         return Feedbacks(
-            feedbacks=[Feedback(node_id=nid, feedback=fb) for nid, fb in self.responses.items() if nid in rendered]
+            feedbacks=[
+                Feedback(node_id=nid, feedback=fb, score=0.5) for nid, fb in self.responses.items() if nid in rendered
+            ]
         )
 
 
@@ -1486,10 +1492,10 @@ def test_backward_forwards_refined_feedback_to_child_params() -> None:
     opt.backward(root, "top-level feedback")
 
     # Root refined the top-level feedback onto the child thread (NOT raw-forwarded).
-    assert child.gradients == ["refined-for-child"]
-    assert "top-level feedback" not in child.gradients
+    assert [g.text for g in child.gradients] == ["refined-for-child"]
+    assert "top-level feedback" not in [g.text for g in child.gradients]
     # The child then refined its gradients onto its own parameter.
-    assert child_param.gradients == ["refined-for-param"]
+    assert [g.text for g in child_param.gradients] == ["refined-for-param"]
 
 
 def test_backward_offers_child_threads_as_routable_targets() -> None:
@@ -1537,9 +1543,9 @@ def test_backward_routes_through_intermediate_thread_to_leaf_param() -> None:
     opt._backward_fn = fn  # type: ignore[assignment]  # noqa: SLF001
     opt.backward(root, "deep feedback")
 
-    assert mid.gradients == ["for-mid"]
-    assert leaf.gradients == ["for-leaf"]
-    assert leaf_param.gradients == ["for-param"]
+    assert [g.text for g in mid.gradients] == ["for-mid"]
+    assert [g.text for g in leaf.gradients] == ["for-leaf"]
+    assert [g.text for g in leaf_param.gradients] == ["for-param"]
 
 
 def test_backward_pass_through_when_no_routable_target() -> None:
@@ -1560,7 +1566,7 @@ def test_backward_pass_through_when_no_routable_target() -> None:
 
     # No routable target at the root → model not called, raw gradients forwarded.
     assert fn.seen_inputs == []
-    assert gradless_child.gradients == ["raw feedback"]
+    assert [g.text for g in gradless_child.gradients] == ["raw feedback"]
 
 
 def test_backward_is_idempotent_across_repeated_calls() -> None:
@@ -1584,5 +1590,5 @@ def test_backward_is_idempotent_across_repeated_calls() -> None:
     opt.backward(root, "fb")
 
     # Node gradients reset each call — child holds exactly one refined item, not two.
-    assert child.gradients == ["refined-for-child"]
-    assert root.gradients == ["fb"]
+    assert [g.text for g in child.gradients] == ["refined-for-child"]
+    assert [g.text for g in root.gradients] == ["fb"]

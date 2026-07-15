@@ -23,7 +23,7 @@ still reconstructed exclusively from the event log.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from strands.types.content import Message
 
@@ -33,6 +33,53 @@ if TYPE_CHECKING:
     from .ids import ThreadId
 
 
+@runtime_checkable
+class ParameterHost(Protocol):
+    """What a reconstructed :class:`ParameterNode` needs from the object that owns it.
+
+    The optimizer matches a recall event's ``backend_id`` to a host, rehydrates
+    the value, and consolidates gradients back into it — the whole contract, and
+    nothing about storage. :class:`~ai_functions.memory.base.MemoryBackend`
+    satisfies it (a text-rewriting host); the economics beliefs adapter also
+    satisfies it (a score-learning host that settles attempt records). Keeping
+    this a structural protocol is what lets a non-memory learner participate in
+    the backward pass without the graph layer knowing it exists.
+    """
+
+    @property
+    def backend_id(self) -> str:
+        """Stable id matched against recall events to recover this host."""
+        ...
+
+    def deserialize_value(self, name: str, raw: Any) -> Any:  # pyright: ignore[reportExplicitAny]
+        """Rehydrate a parameter value from its serialized event representation."""
+        ...
+
+    def _is_procedural(self, name: str) -> bool:  # noqa: PLW3201
+        """Whether ``name`` is a code parameter (rendered as editable code)."""
+        ...
+
+    def consolidate(self, name: str, feedback: list[GradFeedback], retrieved: dict[str, str] | None = None) -> None:
+        """Fold accumulated gradients for ``name`` back into the host's state."""
+        ...
+
+
+@dataclass(frozen=True)
+class GradFeedback:
+    """One textual gradient plus the optional numeric score that accompanies it.
+
+    The element of every node's ``gradients`` list. ``text`` is the refined
+    natural-language feedback the backward pass routes to a target; ``score``
+    is that consumer's ``[0, 1]`` rating of how well the target's value served
+    it, or ``None`` when the backward model produced no score. A parameter host
+    that only rewrites text (the ordinary memory backend) ignores ``score``; a
+    host that learns from it (the economics beliefs adapter) reads it.
+    """
+
+    text: str
+    score: float | None = None
+
+
 @dataclass
 class Node:
     """Base class for all grad-bearing graph nodes."""
@@ -40,7 +87,7 @@ class Node:
     node_id: str
     value: Any = None  # pyright: ignore[reportExplicitAny]
     requires_grad: bool = True
-    gradients: list[str] = field(default_factory=list)
+    gradients: list[GradFeedback] = field(default_factory=list)
 
 
 @dataclass
@@ -59,14 +106,15 @@ class ParameterNode(Node):
     """A memory parameter that was recalled during thread execution.
 
     Reconstructed from ``ParameterRecalledEvent`` events. Holds a **direct
-    reference** to the ``MemoryBackend`` that owns this parameter, so the
+    reference** to the :class:`ParameterHost` that owns this parameter, so the
     optimizer can call ``backend.consolidate(name, feedbacks)`` with no lookup
-    table.
+    table. The host is usually a ``MemoryBackend``, but may be any
+    :class:`ParameterHost` (e.g. the economics beliefs adapter).
     """
 
     name: str = ""
     derivation: Literal["full", "query", "search"] = "full"
-    backend: MemoryBackend | None = field(default=None, repr=False)
+    backend: ParameterHost | None = field(default=None, repr=False)
     description: str = ""
     procedural: bool = False
     meta: dict[str, Any] = field(default_factory=dict)  # pyright: ignore[reportExplicitAny]

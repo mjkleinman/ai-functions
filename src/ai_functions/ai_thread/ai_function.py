@@ -7,6 +7,7 @@ import inspect
 from collections.abc import Callable, Hashable, Sequence
 from typing import TYPE_CHECKING, Any, Unpack, cast, final, overload, override  # pyright: ignore[reportAny]
 
+import tstr
 from strands.tools import ToolProvider
 from strands.tools.decorator import tool as _strands_tool  # pyright: ignore[reportUnknownVariableType]
 from strands.types.tools import AgentTool
@@ -25,6 +26,7 @@ from .config import (
     ThreadMergedKwargs,
     split_config_and_agent_kwargs,
 )
+from .errors import AIFunctionError
 
 
 def _merge_config(
@@ -144,6 +146,62 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
     def input_shape(self) -> InputShape:
         """Coarse classification of this template's ``prompt_fn`` signature."""
         return self._input_shape
+
+    async def render_prompt(self, *args: P.args, **kwargs: P.kwargs) -> str:
+        """Render the prompt string this template produces for the given arguments.
+
+        The same rendering ``AIThread.execute`` performs before a cycle, exposed
+        on the template so callers that need the prompt *without* running the
+        function (e.g. cost forecasters ranking models per-task) can obtain it.
+
+        Args:
+            args: Positional arguments forwarded to ``prompt_fn``.
+            kwargs: Keyword arguments forwarded to ``prompt_fn``.
+
+        Returns:
+            The rendered prompt string.
+
+        Raises:
+            AIFunctionError: ``prompt_fn`` returned ``None`` and has no
+                docstring to use as a template.
+
+        Strategy:
+            1. Call ``self.prompt_fn(*args, **kwargs)``; if it is a coroutine,
+               await it (``async def`` prompt bodies are supported).
+            2. If ``prompt_fn`` returns ``None``, interpret its docstring as a
+               ``tstr`` template and interpolate it with the bound arguments
+               and the function's globals as context.
+        """
+        result = self._prompt_fn(*args, **kwargs)
+        if inspect.iscoroutine(result):
+            result = await result
+        if result is not None:
+            return result
+
+        doc = self._prompt_fn.__doc__
+        if not doc:
+            raise AIFunctionError(
+                "prompt_fn returned None and has no docstring to use as a template",
+                function_name=self._name,
+            )
+
+        # Build context from bound arguments
+        sig = inspect.signature(self._prompt_fn)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        context: dict[str, object] = dict(bound.arguments)
+
+        if hasattr(self._prompt_fn, "__globals__"):
+            fn_globals = self._prompt_fn.__globals__
+        else:
+            fn_globals = dict[str, Any]()  # pyright: ignore[reportExplicitAny]
+        # use_eval=True (matching both ancestor implementations) so docstring
+        # templates may use attribute access and expressions — e.g.
+        # ``{response.summary}`` or ``{bullet_points(items)}`` — not just bare
+        # variable names. The template is the function's own docstring (trusted
+        # author-supplied text), interpolated with the call's bound arguments.
+        template = tstr.generate_template(doc, context, globals=fn_globals, use_eval=True)  # pyright: ignore[reportUnknownMemberType]
+        return tstr.render(template)
 
     # ── Spawnable ──
 

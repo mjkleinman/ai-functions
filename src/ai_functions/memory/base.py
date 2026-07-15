@@ -38,7 +38,7 @@ from strands.tools.decorator import tool as _strands_tool  # pyright: ignore[rep
 
 from ..types.context import current_thread_scope, no_thread_scope
 from ..types.events import EventKind, ParameterRecalledEvent
-from ..types.graph import ParameterView
+from ..types.graph import GradFeedback, ParameterView
 from .frozen import FrozenMarker
 from .procedural import ProceduralMarker
 
@@ -189,7 +189,7 @@ class MemoryBackend(ABC):
     def _consolidate(
         self,
         name: str,
-        feedback: list[str],
+        feedback: list[GradFeedback],
         retrieved: dict[str, str] | None = None,
         **kwargs: Any,  # pyright: ignore[reportExplicitAny]
     ) -> None:
@@ -197,7 +197,8 @@ class MemoryBackend(ABC):
 
         Args:
             name: Parameter name.
-            feedback: Feedback strings to merge into the stored value.
+            feedback: Gradients to merge into the stored value. A text-rewriting
+                backend reads each entry's ``text`` and ignores its ``score``.
             retrieved: For list parameters, the ``{entry_id: value}`` mapping of
                 the entries the forward pass actually retrieved (from the search
                 derivation meta), so consolidation can target them; ``None``
@@ -432,7 +433,9 @@ class MemoryBackend(ABC):
             meta=view.meta or None,
         )
 
-    def consolidate(self, name: str, feedback: list[str], retrieved: dict[str, str] | None = None) -> None:
+    def consolidate(
+        self, name: str, feedback: list[GradFeedback], retrieved: dict[str, str] | None = None
+    ) -> None:
         """Incorporate feedback into a parameter.
 
         Runs with the ambient thread scope cleared: consolidation's internal
@@ -441,7 +444,9 @@ class MemoryBackend(ABC):
 
         Args:
             name: Parameter name.
-            feedback: Feedback strings to merge into the stored value.
+            feedback: Gradients to merge into the stored value. A text-rewriting
+                backend reads each entry's ``text``; the numeric ``score`` is
+                for hosts (e.g. the economics beliefs adapter) that learn from it.
             retrieved: For list parameters, the ``{entry_id: value}`` mapping
                 the forward pass retrieved (merged from the search derivation
                 meta by the optimizer), so consolidation targets those entries;
@@ -453,6 +458,17 @@ class MemoryBackend(ABC):
     def save(self, name: str, value: Any) -> None:  # pyright: ignore[reportExplicitAny]
         """Store a parameter's value directly, without consolidation."""
         self._save(name, value)
+
+    def fetch(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
+        """Return a parameter's current value without emitting a recall event.
+
+        The synchronous, event-free counterpart of :meth:`recall`, for
+        machinery reading its own bookkeeping state (e.g. a belief provider
+        loading persisted statistics): a plain read that must not appear as a
+        dataflow edge in any thread's optimization graph.
+        """
+        value, _ = self._recall(name)  # pyright: ignore[reportAny]
+        return value
 
     def delete(self, name: str) -> None:
         """Reset a parameter to its schema default."""

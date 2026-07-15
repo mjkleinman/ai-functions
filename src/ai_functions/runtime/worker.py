@@ -437,6 +437,11 @@ class LocalWorker(WorkerAdapter):
         """
         await self.register()
         tid = thread_id if thread_id is not None else ThreadId(f"thread-{uuid.uuid4().hex[:12]}")
+        if thread_name is None:
+            # Same display-name defaulting as ``Coordinator.spawn``: derive it
+            # from the spawnable so event logs carry the function's name.
+            name = getattr(target, "name", None)
+            thread_name = name if isinstance(name, str) and name else None
 
         # Register the ThreadInfo with the coordinator BEFORE allocating
         # per-thread state on the worker — the coordinator is the source

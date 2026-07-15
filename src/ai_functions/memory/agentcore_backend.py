@@ -44,6 +44,8 @@ MAX_MEMORY_RECORDS = 100
 if TYPE_CHECKING:
     from bedrock_agentcore.memory import MemorySession
 
+    from ..types.graph import GradFeedback
+
 
 def _require_agentcore() -> Any:  # pyright: ignore[reportExplicitAny]
     """Import and return the ``bedrock_agentcore.memory`` module, or raise.
@@ -374,11 +376,14 @@ class AgentCoreMemoryBackend(MemoryBackend):
     def _consolidate(
         self,
         name: str,
-        feedback: list[str],
+        feedback: list[GradFeedback],
         retrieved: dict[str, str] | None = None,
         **kwargs: Any,  # pyright: ignore[reportExplicitAny]
     ) -> None:
         """Append feedback as conversation turns for AgentCore to consolidate.
+
+        Reads each gradient's ``text``; the numeric ``score`` is for
+        score-learning hosts, not for this semantic-memory strategy.
 
         ``retrieved`` is accepted for contract compatibility but unused:
         AgentCore's semantic strategy decides itself which memories the
@@ -395,7 +400,7 @@ class AgentCoreMemoryBackend(MemoryBackend):
         session = self._get_session(actor)
         for item in feedback:
             session.add_turns(
-                messages=[acm.constants.ConversationalMessage(item, acm.constants.MessageRole.USER)],
+                messages=[acm.constants.ConversationalMessage(item.text, acm.constants.MessageRole.USER)],
                 metadata={"type": {"stringValue": "feedback"}, "name": {"stringValue": name}},
                 event_timestamp=datetime.now(UTC),
             )

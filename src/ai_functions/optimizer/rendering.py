@@ -33,6 +33,10 @@ def render_inputs(nodes: Sequence[Node]) -> str:
     ``ThreadNode`` s render as ``type: result`` (a downstream function output
     that can be improved). The distinction lets the model route feedback to the
     right target instead of dumping everything into the one visible parameter.
+
+    Any usage guidance a target needs (e.g. how a routing decision's score is
+    consumed) travels in its own ``description``, so the generic optimizer
+    stays free of module-specific rules.
     """
     result: dict[str, Any] = {}  # pyright: ignore[reportExplicitAny]
     for node in nodes:

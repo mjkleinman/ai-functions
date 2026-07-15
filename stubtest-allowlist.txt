@@ -42,6 +42,7 @@ ai_functions.types.ids.EventId
 ai_functions.types.ids.MessageId
 ai_functions.types.ids.ThreadId
 ai_functions.types.ids.WorkerId
+ai_functions.experimental.economics.types.RecordId
 
 # pydantic mangles __context in model_post_init; not our concern
 ai_functions.ai_thread.postcondition.PostConditionResult.model_post_init
@@ -71,6 +72,22 @@ ai_functions.optimizer.textgrad.logger
 # Memory backend module loggers are internal implementation detail.
 ai_functions.memory.agentcore_backend.logger
 ai_functions.memory.base.logger
+
+# economics: module-level loggers are private implementation detail
+ai_functions.experimental.economics.beliefs.logger
+ai_functions.experimental.economics.function.logger
+
+# economics: the default forecaster brain is an @ai_function-decorated function
+# (an AIFunction at runtime), an internal default swappable via LLMForecaster's
+# forecast_fn; its schema types are internal to that default and not stubbed.
+ai_functions.experimental.economics.beliefs.forecast
+ai_functions.experimental.economics.beliefs.CandidateForecast
+ai_functions.experimental.economics.beliefs.ForecastResult
+
+# PEP 695 generics create __type_params__ at runtime; not representable in stubs
+ai_functions.experimental.economics.types.Candidate.__type_params__
+ai_functions.experimental.economics.function.EconomicFunction.__type_params__
+ai_functions.experimental.economics.function.EconomicThread.__type_params__
 
 # debug.py is an opt-in console dump of the exact per-model-call request,
 # gated on the AI_FUNCTIONS_SHOW_PROMPTS env var and imported lazily inside

@@ -89,9 +89,13 @@ class TextGradOptimizer:
             feedback: Natural-language description of what should change.
 
         Ensures:
-            - ``feedback`` is appended to ``root.gradients``.
+            - ``feedback`` is appended to ``root.gradients`` as a
+              :class:`~ai_functions.types.graph.GradFeedback`.
             - For every grad-enabled parameter the model deems relevant, a
-              refined feedback string is appended to its ``gradients``.
+              refined ``GradFeedback`` (text plus the model's ``[0, 1]`` score)
+              is appended to its ``gradients``. A text-rewriting host uses the
+              text; a score-learning host (the economics beliefs adapter) uses
+              the score.
             - Each node's gradients are forwarded to its child threads.
             - Parameters with ``requires_grad=False`` receive no gradients.
             - Model feedback matching no parameter is dropped with a warning

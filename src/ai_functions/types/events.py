@@ -68,6 +68,7 @@ class EventKind(enum.StrEnum):
     PARAMETER_RECALLED = "parameter_recalled"
 
     THREAD_SPAWNED = "thread_spawned"
+    TRACE_DELEGATION = "trace_delegation"
 
 
 class TokenUsage(BaseModel):
@@ -443,6 +444,30 @@ class ThreadSpawnedEvent(BaseEvent):
     """Id of the spawned child thread; the key ``build_graph`` recurses on."""
 
 
+class TraceDelegationEvent(BaseEvent):
+    """This thread's conversation is delegated to one of its children.
+
+    Emitted by a *supervisor* thread that runs no model itself but selects a
+    child that does (the economic search selecting the responsible attempt, a
+    retry wrapper, an ensemble coordinator). At graph-build time ``build_graph``
+    splices the named child's reconstructed messages onto this node, so the
+    backward pass sees the real conversation rather than the supervisor's
+    telemetry. Any narration the supervisor wants ahead of the spliced messages
+    is emitted as ordinary ``MessageUserEvent`` s before this marker.
+
+    Like ``ThreadSpawnedEvent`` it is **not** a ``RenderableEvent``: single-log
+    ``reconstruct_messages`` filters it out (the child's log is not available
+    there); the splice happens only in the cross-thread graph build.
+
+    Invariants:
+        I9 — non-renderable; inert to single-thread message reconstruction.
+    """
+
+    kind: Literal[EventKind.TRACE_DELEGATION] = EventKind.TRACE_DELEGATION
+    child_thread_id: ThreadId
+    """Id of the child whose messages this node adopts at graph-build time."""
+
+
 # ── User-defined extension ────────────────────────────────────────────────────
 
 
@@ -534,7 +559,8 @@ SystemEvent = Annotated[
     | TokenUsageEvent
     | ResultEvent
     | ParameterRecalledEvent
-    | ThreadSpawnedEvent,
+    | ThreadSpawnedEvent
+    | TraceDelegationEvent,
     Field(discriminator="kind"),
 ]
 

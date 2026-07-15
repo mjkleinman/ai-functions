@@ -10,7 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast, final
 
-import tstr
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, create_model
 from strands import Agent
 from strands.agent.agent_result import AgentResult
@@ -300,6 +299,10 @@ class _EventBridgeHook(HookProvider):
             raw_content = message.get("content", [])
             if isinstance(raw_content, list):
                 content = list(cast("list[object]", raw_content))
+        from .debug import print_model_response, prompts_enabled
+
+        if prompts_enabled():
+            print_model_response(content, thread_name=self._thread_name, call_index=self._model_calls)
         ctx.on_event(
             MessageAssistantCompleteEvent(
                 message_id=message_id,
@@ -627,15 +630,10 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
                 # execution there is no channel left to retry, so fail.
                 if isinstance(plan, DisabledPlan):
                     raise AIFunctionError(
-                        "Agent produced neither a structured output nor a "
-                        "python_executor final_answer result.",
+                        "Agent produced neither a structured output nor a python_executor final_answer result.",
                         function_name=function_name,
                     ) from None
-                guidance = (
-                    "[VALIDATION ERROR]\n"
-                    "No result was produced.\n\n"
-                    f"{self._final_result_instruction(plan)}"
-                )
+                guidance = f"[VALIDATION ERROR]\nNo result was produced.\n\n{self._final_result_instruction(plan)}"
                 self._inject_buffer.append(guidance)
                 continue
 
@@ -931,54 +929,17 @@ class AIThread[**P, T](Thread):  # type: ignore[type-arg]
     async def _generate_prompt(self, *args: P.args, **kwargs: P.kwargs) -> str:
         """Render the prompt string from template arguments.
 
+        Delegates to :meth:`AIFunction.render_prompt` — rendering is a
+        property of the template, not of this thread's state.
+
         Args:
             args: Positional arguments forwarded from ``execute``.
             kwargs: Keyword arguments forwarded from ``execute``.
 
         Returns:
             The rendered prompt string.
-
-        Strategy:
-            1. Call ``self._template.prompt_fn(*args, **kwargs)``; if it is a
-               coroutine function, await it (``async def`` prompt bodies are
-               supported).
-            2. If ``prompt_fn`` returns ``None``, interpret
-               ``prompt_fn.__doc__`` as a ``tstr`` template and
-               interpolate it using the function arguments and their
-               enclosing globals as context.
-            3. If there is no docstring either, raise
-               ``AIFunctionError``.
         """
-        result = self._template.prompt_fn(*args, **kwargs)
-        if inspect.iscoroutine(result):
-            result = await result
-        if result is not None:
-            return result
-
-        doc = self._template.prompt_fn.__doc__
-        if not doc:
-            raise AIFunctionError(
-                "prompt_fn returned None and has no docstring to use as a template",
-                function_name=self._template.name,
-            )
-
-        # Build context from bound arguments
-        sig = inspect.signature(self._template.prompt_fn)
-        bound = sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        context: dict[str, object] = dict(bound.arguments)
-
-        if hasattr(self._template.prompt_fn, "__globals__"):
-            fn_globals = self._template.prompt_fn.__globals__
-        else:
-            fn_globals = dict[str, Any]()  # pyright: ignore[reportExplicitAny]
-        # use_eval=True (matching both ancestor implementations) so docstring
-        # templates may use attribute access and expressions — e.g.
-        # ``{response.summary}`` or ``{bullet_points(items)}`` — not just bare
-        # variable names. The template is the function's own docstring (trusted
-        # author-supplied text), interpolated with the call's bound arguments.
-        template = tstr.generate_template(doc, context, globals=fn_globals, use_eval=True)  # pyright: ignore[reportUnknownMemberType]
-        return tstr.render(template)
+        return await self._template.render_prompt(*args, **kwargs)
 
     def _extract_result(
         self,

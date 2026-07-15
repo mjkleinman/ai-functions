@@ -39,7 +39,7 @@ from strands.tools import ToolProvider
 from strands.types.tools import AgentTool
 
 from ..protocols import Coordinator
-from ..types.graph import ParameterView
+from ..types.graph import GradFeedback, ParameterView
 from ..types.ids import ThreadId
 
 # Value shape stored by the simple built-in backends (JSON, AgentCore).
@@ -116,7 +116,7 @@ class MemoryBackend(ABC):
     def _consolidate(
         self,
         name: str,
-        feedback: list[str],
+        feedback: list[GradFeedback],
         retrieved: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -124,7 +124,8 @@ class MemoryBackend(ABC):
 
         Args:
             name: Parameter name.
-            feedback: Feedback strings to merge into the stored value.
+            feedback: Gradients to merge into the stored value; a text-rewriting
+                backend reads each entry's ``text`` and ignores its ``score``.
             retrieved: For list parameters, the ``{entry_id: value}`` mapping of
                 the entries the forward pass actually retrieved (from the search
                 derivation meta); ``None`` means no retrieval context.
@@ -289,7 +290,9 @@ class MemoryBackend(ABC):
         """
         ...
 
-    def consolidate(self, name: str, feedback: list[str], retrieved: dict[str, str] | None = None) -> None:
+    def consolidate(
+        self, name: str, feedback: list[GradFeedback], retrieved: dict[str, str] | None = None
+    ) -> None:
         """Incorporate ``feedback`` into parameter ``name``.
 
         Runs with the ambient thread scope cleared, so consolidation's
@@ -297,7 +300,8 @@ class MemoryBackend(ABC):
 
         Args:
             name: Parameter name.
-            feedback: Feedback strings to merge into the stored value.
+            feedback: Gradients to merge into the stored value; a text-rewriting
+                backend reads each entry's ``text``.
             retrieved: For list parameters, the ``{entry_id: value}`` mapping
                 the forward pass retrieved (merged from the search derivation
                 meta by the optimizer), so consolidation targets those entries;
@@ -311,6 +315,15 @@ class MemoryBackend(ABC):
         Args:
             name: Parameter name.
             value: New value to store.
+        """
+        ...
+
+    def fetch(self, name: str) -> Any:
+        """Return a parameter's current value without emitting a recall event.
+
+        The synchronous, event-free counterpart of :meth:`recall`, for
+        machinery reading its own bookkeeping state (e.g. a belief provider
+        loading persisted statistics).
         """
         ...
 

@@ -46,12 +46,29 @@ if TYPE_CHECKING:
 
     from strands.types.tools import AgentTool
 
+    from ..types.graph import GradFeedback
+
 _FORMAT_KEY = "_format"
 _FORMAT_VERSION = 2
 
 
 def _bullet_points(values: list[str]) -> str:
-    return "\n".join(f"- {v}" for v in values)
+    # Gradient text often arrives already bulleted; strip one leading bullet
+    # before re-bulleting so entries never render as "- - add: ...".
+    return "\n".join(f"- {v.strip().removeprefix('- ').strip()}" for v in values)
+
+
+def _format_block(description: str) -> str:
+    """Render a parameter's schema description as format instructions, or ``""``.
+
+    The description is where the user prescribes what the parameter should
+    contain and how updates should merge (e.g. "update the matching entry
+    instead of adding a near-duplicate"); consolidation must honor it, not
+    just the raw feedback.
+    """
+    if not description:
+        return ""
+    return f"<format_instructions>\n{description}\n</format_instructions>\n\n"
 
 
 def _check_valid_python(response: str) -> PostConditionResult:
@@ -63,16 +80,20 @@ def _check_valid_python(response: str) -> PostConditionResult:
     return PostConditionResult(passed=True)
 
 
-@ai_function[str](structured_output=False)
-def _consolidate_list(memories: str, feedback: str) -> str:
+# coordinator_tools_enabled=False on all four: memory-internal machinery must
+# not discover or message threads (its only surface is the memory tools).
+@ai_function[str](structured_output=False, coordinator_tools_enabled=False)
+def _consolidate_list(memories: str, feedback: str, description: str = "") -> str:
     """Drive the list-consolidation agent: edit entries with the memory tools."""
     return (
         "You are a memory manager. The memory entries listed below were retrieved from a "
         "memory store because they are relevant to the feedback. Use the provided tools to "
         "search, add, update, or delete entries as needed to incorporate the feedback.\n\n"
+        f"{_format_block(description)}"
         f"<retrieved_memories>\n{memories}\n</retrieved_memories>\n\n"
         f"<feedback>\n{feedback}\n</feedback>\n\n"
         "Rules:\n"
+        "- Follow the format_instructions above, when present.\n"
         "- Update or delete entries by the entry_id shown above; use search_memories to find others.\n"
         "- Prefer updating an existing entry over adding a near-duplicate.\n"
         "- Keep each entry concise and self-contained.\n"
@@ -80,29 +101,34 @@ def _consolidate_list(memories: str, feedback: str) -> str:
     )
 
 
-@ai_function[str]
-def _consolidate_value(value: str, feedback: list[str]) -> str:
+@ai_function[str](coordinator_tools_enabled=False)
+def _consolidate_value(value: str, feedback: list[str], description: str = "") -> str:
     """Build the prompt to merge feedback into a scalar-valued parameter."""
     return (
         "Update the following value with the feedback provided.\n"
+        "The format_instructions, when present, describe what the value must contain "
+        "and how updates should be merged into it — follow them.\n"
         "Return the updated value.\n\n"
+        f"{_format_block(description)}"
         f"<value>\n{value}\n</value>\n\n"
         f"<feedback>\n{_bullet_points(feedback)}\n</feedback>"
     )
 
 
-@ai_function[str](post_conditions=[_check_valid_python])
-def _consolidate_procedural(value: str, feedback: list[str]) -> str:
+@ai_function[str](post_conditions=[_check_valid_python], coordinator_tools_enabled=False)
+def _consolidate_procedural(value: str, feedback: list[str], description: str = "") -> str:
     """Build the prompt to merge feedback into a code-valued parameter."""
     return (
         "Update the following code with the feedback provided.\n"
+        "The format_instructions, when present, describe what the code must do — follow them.\n"
         "Return the complete updated code as a string.\n\n"
+        f"{_format_block(description)}"
         f"<code>\n{value}\n</code>\n\n"
         f"<feedback>\n{_bullet_points(feedback)}\n</feedback>"
     )
 
 
-@ai_function[str]
+@ai_function[str](coordinator_tools_enabled=False)
 def _query_value(value: str, query: str) -> str:
     """Build the prompt to answer a question over a parameter's value."""
     return (
@@ -284,13 +310,18 @@ class JSONMemoryBackend(MemoryBackend):
     def _consolidate(
         self,
         name: str,
-        feedback: list[str],
+        feedback: list[GradFeedback],
         retrieved: dict[str, str] | None = None,
         **kwargs: Any,  # pyright: ignore[reportExplicitAny]
     ) -> None:
+        # This backend rewrites text; the numeric score is for score-learning
+        # hosts (economics beliefs), not for prompt-based consolidation.
+        texts = [g.text for g in feedback]
         if self._is_procedural(name):
             value = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
-            value = self._consolidate_procedural_fn.run_sync(value=value, feedback=feedback)
+            value = self._consolidate_procedural_fn.run_sync(
+                value=value, feedback=texts, description=self._get_description(name)
+            )
             _set_nested_attr(self._model, name, value)
         elif self._is_list_field(name):
             # The agentic consolidator's CRUD tools are typed for str entries;
@@ -300,10 +331,12 @@ class JSONMemoryBackend(MemoryBackend):
                     f"JSONMemoryBackend cannot consolidate non-string list parameter '{name}'. "
                     f"Only list[str] (and str / Procedural) fields are supported."
                 )
-            self._consolidate_entries(name, feedback, retrieved)
+            self._consolidate_entries(name, texts, retrieved)
         else:
             value = _get_nested_attr(self._model, name)  # pyright: ignore[reportAny]
-            value = self._consolidate_value_fn.run_sync(value=value, feedback=feedback)
+            value = self._consolidate_value_fn.run_sync(
+                value=value, feedback=texts, description=self._get_description(name)
+            )
             _set_nested_attr(self._model, name, value)
 
     def _consolidate_entries(self, name: str, feedback: list[str], retrieved: dict[str, str] | None) -> None:
@@ -320,7 +353,11 @@ class JSONMemoryBackend(MemoryBackend):
         entries = self.list_entries(name)
         snapshot = {i: entries[i] for i in (retrieved or {}) if i in entries} or entries
         fn = self._consolidate_list_fn.replace(tools=[MemoryToolProvider(self, name)])
-        fn.run_sync(memories=to_yaml(snapshot), feedback=_bullet_points(feedback))
+        fn.run_sync(
+            memories=to_yaml(snapshot),
+            feedback=_bullet_points(feedback),
+            description=self._get_description(name),
+        )
 
     def _delete(self, name: str) -> None:
         """Reset a parameter to its schema default."""

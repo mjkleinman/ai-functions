@@ -24,7 +24,7 @@ from ..ai_thread import ai_function
 from ..ai_thread.errors import AIFunctionError
 from ..ai_thread.postcondition import PostConditionResult
 from ..types.context import no_thread_scope
-from ..types.graph import Node, ParameterNode, ThreadNode
+from ..types.graph import GradFeedback, Node, ParameterNode, ThreadNode
 from ._graph import build_graph_from_result, leads_to_grad_parameter, topological_sort
 from .rendering import render_inputs, render_messages
 
@@ -54,6 +54,15 @@ class Feedback(BaseModel):
         "The feedback MUST be relevant to the node description, if any. "
         "Feedback MUST be general and applicable to different future inputs.",
     )
+    score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="A number in [0, 1] rating how well this input's VALUE actually served "
+        "the agent's output — 1.0 = fully useful, 0.0 = useless. Rate the value as it was "
+        "consumed, independently of the improvements you suggest in `feedback`. An input's "
+        "score_note, when present, says how the score will be used.",
+    )
 
 
 class Feedbacks(BaseModel):
@@ -62,7 +71,9 @@ class Feedbacks(BaseModel):
     feedbacks: list[Feedback]
 
 
-@ai_function[Feedbacks]
+# coordinator_tools_enabled=False: the backward model is internal machinery
+# operating on a *finished* trace — it must not list or message live threads.
+@ai_function[Feedbacks](coordinator_tools_enabled=False)
 def _compute_gradients(
     inputs: str,
     trace: str,
@@ -152,12 +163,12 @@ class TextGradOptimizer:
         """
         sorted_nodes = topological_sort(root)
 
-        # Idempotent backward: reset node gradients (parameter gradients persist
-        # and accumulate; they are cleared explicitly by zero_grad).
+        # Idempotent backward: reset intermediate node gradients (parameter
+        # gradients persist and accumulate; they are cleared by zero_grad).
         for node in sorted_nodes:
             node.gradients.clear()
 
-        root.gradients.append(feedback)
+        root.gradients.append(GradFeedback(text=feedback))
         self.last_dropped_feedback = []
 
         for node in sorted_nodes:
@@ -222,7 +233,7 @@ class TextGradOptimizer:
                     inputs=render_inputs(targets),
                     trace=render_messages(node.messages, {}),
                     output=str(node.value or ""),
-                    feedback=list(node.gradients),
+                    feedback=[g.text for g in node.gradients],
                     optimize_tools=self.optimize_tools,
                 )
         except AIFunctionError:
@@ -247,12 +258,13 @@ class TextGradOptimizer:
                     fb.node_id,
                     node.thread_id,
                 )
-            elif isinstance(target, ParameterNode):
-                target.gradients.append(fb.feedback)
             else:
-                # Child ThreadNode: append refined feedback; the child
-                # re-distributes it to its own targets when visited.
-                target.gradients.append(fb.feedback)
+                # Route the refined feedback and its score together. A
+                # ParameterNode's host reads the text (and, for a score-learning
+                # host like the economics beliefs adapter, the score); a child
+                # ThreadNode re-distributes the text to its own targets when
+                # visited and carries the score to its own parameter hosts.
+                target.gradients.append(GradFeedback(text=fb.feedback, score=fb.score))
 
     def consolidate(self, root: ThreadNode) -> None:
         """Consolidate accumulated parameter gradients into their memory backends.
@@ -264,7 +276,7 @@ class TextGradOptimizer:
         retrieved) is merged across the group and passed along, so a backend
         can target consolidation at those entries instead of the full value.
         """
-        grouped: dict[tuple[int, str], tuple[ParameterNode, list[str], dict[str, str]]] = {}
+        grouped: dict[tuple[int, str], tuple[ParameterNode, list[GradFeedback], dict[str, str]]] = {}
         for node in topological_sort(root):
             for p in node.parameters:
                 if not p.gradients or p.backend is None:
@@ -277,6 +289,10 @@ class TextGradOptimizer:
                 if isinstance(results, dict):
                     grouped[key][2].update({str(k): str(v) for k, v in results.items()})  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
 
+        # One consolidate per (backend, parameter). A text-rewriting backend
+        # reads each gradient's text; a score-learning host (the economics
+        # beliefs adapter) reads the scores and settles its records. Both are
+        # ``consolidate`` calls matched by ``backend_id`` — no separate hook.
         for (_, param_name), (param, feedbacks, retrieved) in grouped.items():
             assert param.backend is not None
             param.backend.consolidate(param_name, feedbacks, retrieved=retrieved or None)

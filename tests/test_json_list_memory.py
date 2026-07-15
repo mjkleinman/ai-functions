@@ -17,7 +17,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from ai_functions import JSONMemoryBackend, TextGradOptimizer, ai_function, build_graph_from_result
-from ai_functions.types.graph import ParameterNode, ThreadNode
+from ai_functions.types.graph import GradFeedback, ParameterNode, ThreadNode
 
 
 class CookingMemory(BaseModel):
@@ -230,7 +230,7 @@ def test_agentic_consolidation_edits_entries_by_id(tmp_path: Path) -> None:
     )
     mem._consolidate_list_fn = mem._consolidate_list_fn.replace(model=model)  # noqa: SLF001
 
-    mem.consolidate("tips", ["fix the salt tip; drop the spice tip; add a tomato tip"])
+    mem.consolidate("tips", [GradFeedback(text="fix the salt tip; drop the spice tip; add a tomato tip")])
 
     assert mem.list_entries("tips") == {
         "1": "salt the water; save a cup for the sauce",  # updated in place, id kept
@@ -247,7 +247,9 @@ def test_consolidation_snapshot_targets_retrieved_entries(tmp_path: Path) -> Non
     capture = _CaptureConsolidateFn()
     mem._consolidate_list_fn = cast("Any", capture)  # noqa: SLF001
 
-    mem.consolidate("tips", ["fb"], retrieved={"2": "stale text from search time", "99": "deleted since"})
+    mem.consolidate(
+        "tips", [GradFeedback(text="fb")], retrieved={"2": "stale text from search time", "99": "deleted since"}
+    )
 
     assert capture.kwargs is not None
     memories = capture.kwargs["memories"]
@@ -263,7 +265,7 @@ def test_consolidation_without_context_shows_all_entries(tmp_path: Path) -> None
     capture = _CaptureConsolidateFn()
     mem._consolidate_list_fn = cast("Any", capture)  # noqa: SLF001
 
-    mem.consolidate("tips", ["fb"])
+    mem.consolidate("tips", [GradFeedback(text="fb")])
 
     assert capture.kwargs is not None
     for value in CookingMemory().tips:
@@ -284,9 +286,9 @@ def test_scalar_consolidation_routes_through_rewrite(tmp_path: Path) -> None:
     capture = _CaptureConsolidateFn(returns="a warmer style")
     mem._consolidate_value_fn = cast("Any", capture)  # noqa: SLF001
 
-    mem.consolidate("style", ["be warmer"])
+    mem.consolidate("style", [GradFeedback(text="be warmer")])
 
-    assert capture.kwargs == {"value": "plain", "feedback": ["be warmer"]}
+    assert capture.kwargs == {"value": "plain", "feedback": ["be warmer"], "description": "Writing style."}
     assert mem._recall("style")[0] == "a warmer style"  # noqa: SLF001 -- stored verbatim, no trailing newline
 
 
@@ -301,7 +303,7 @@ def test_optimizer_consolidate_merges_retrieved_across_nodes(tmp_path: Path) -> 
 
     def _param(results: dict[str, str]) -> ParameterNode:
         return ParameterNode(
-            node_id="tips", name="tips", backend=mem, gradients=["fb"], meta={"results": results}
+            node_id="tips", name="tips", backend=mem, gradients=[GradFeedback(text="fb")], meta={"results": results}
         )
 
     child = ThreadNode(node_id="c", thread_id="c", parameters=[_param({"2": "rest the meat"})])

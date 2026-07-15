@@ -58,6 +58,26 @@ class AIFunction[**P, T](ToolProvider, Spawnable[P, T]):
         """The user-provided prompt builder."""
         ...
 
+    async def render_prompt(self, *args: P.args, **kwargs: P.kwargs) -> str:
+        """Render the prompt string this template produces for the given arguments.
+
+        The same rendering ``AIThread.execute`` performs before a cycle, exposed
+        on the template so callers that need the prompt *without* running the
+        function (e.g. cost forecasters ranking models per-task) can obtain it.
+
+        Args:
+            args: Positional arguments forwarded to ``prompt_fn``.
+            kwargs: Keyword arguments forwarded to ``prompt_fn``.
+
+        Returns:
+            The rendered prompt string.
+
+        Raises:
+            AIFunctionError: ``prompt_fn`` returned ``None`` and has no
+                docstring to use as a template.
+        """
+        ...
+
     # ── Spawnable ──
 
     def to_thread(

@@ -440,7 +440,9 @@ class _EchoBackwardFn:
         del kwargs
         self.calls += 1
         target_ids = list(yaml.safe_load(inputs).keys())
-        return Feedbacks(feedbacks=[Feedback(node_id=tid, feedback=f) for tid in target_ids for f in feedback])
+        return Feedbacks(
+            feedbacks=[Feedback(node_id=tid, feedback=f, score=0.5) for tid in target_ids for f in feedback]
+        )
 
 
 def _node(node_id: str, *, params: bool = False) -> ThreadNode:
@@ -470,10 +472,10 @@ def test_backward_diamond_accumulates_from_both_parents() -> None:
 
     opt.backward(root, "fix it")
 
-    assert shared.gradients == ["fix it", "fix it"]  # one contribution per parent
+    assert [g.text for g in shared.gradients] == ["fix it", "fix it"]  # one contribution per parent
     # root, b1, b2, shared each distribute exactly once (shared visited once).
     assert stub.calls == 4
-    assert shared.parameters[0].gradients == ["fix it", "fix it"]  # refined onto the leaf param
+    assert [g.text for g in shared.parameters[0].gradients] == ["fix it", "fix it"]  # refined onto the leaf param
     assert opt.last_dropped_feedback == []
 
 
@@ -488,7 +490,7 @@ def test_backward_records_dropped_feedback() -> None:
 
         def run_sync(self, **kwargs: object) -> Feedbacks:
             del kwargs
-            return Feedbacks(feedbacks=[Feedback(node_id="no-such-param", feedback="x")])
+            return Feedbacks(feedbacks=[Feedback(node_id="no-such-param", feedback="x", score=0.5)])
 
     opt = TextGradOptimizer()
     opt._backward_fn = cast("Any", _MismatchedFn())  # noqa: SLF001

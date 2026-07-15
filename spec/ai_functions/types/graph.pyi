@@ -16,7 +16,7 @@ All grad-bearing nodes share a common base carrying ``node_id``, ``value``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal, Protocol, TYPE_CHECKING, runtime_checkable
 
 from strands.types.content import Message
 
@@ -26,6 +26,37 @@ if TYPE_CHECKING:
     from .ids import ThreadId
 
 
+@dataclass(frozen=True)
+class GradFeedback:
+    """One textual gradient plus the optional numeric score that accompanies it.
+
+    The element of every node's ``gradients`` list. A text-rewriting parameter
+    host ignores ``score``; a score-learning host (the economics beliefs
+    adapter) reads it.
+    """
+
+    text: str
+    score: float | None = None
+
+
+@runtime_checkable
+class ParameterHost(Protocol):
+    """What a reconstructed ``ParameterNode`` needs from the object that owns it.
+
+    The optimizer matches a recall event's ``backend_id`` to a host, rehydrates
+    the value, and consolidates gradients back into it. ``MemoryBackend``
+    satisfies it (a text-rewriting host); the economics beliefs adapter also
+    satisfies it (a score-learning host). A structural protocol so the graph
+    layer needs no dependency on either.
+    """
+
+    @property
+    def backend_id(self) -> str: ...
+    def deserialize_value(self, name: str, raw: Any) -> Any: ...
+    def _is_procedural(self, name: str) -> bool: ...
+    def consolidate(self, name: str, feedback: list[GradFeedback], retrieved: dict[str, str] | None = None) -> None: ...
+
+
 @dataclass
 class Node:
     """Base class for all grad-bearing graph nodes."""
@@ -33,7 +64,7 @@ class Node:
     node_id: str
     value: Any = None
     requires_grad: bool = True
-    gradients: list[str] = field(default_factory=list)
+    gradients: list[GradFeedback] = field(default_factory=list)
 
 
 @dataclass
@@ -52,8 +83,10 @@ class ParameterNode(Node):
     """A memory parameter that was recalled during thread execution.
 
     Reconstructed from parameter-recall events. Holds a **direct reference**
-    to the ``MemoryBackend`` that owns this parameter, so the optimizer can
-    call ``backend.consolidate(name, feedbacks)`` with no lookup table.
+    to the ``ParameterHost`` that owns this parameter, so the optimizer can
+    call ``backend.consolidate(name, feedbacks)`` with no lookup table. Usually
+    a ``MemoryBackend``, but may be any ``ParameterHost`` (e.g. the economics
+    beliefs adapter).
 
     ``description`` is present on every parameter; ``meta`` carries
     backend-specific data (e.g. query, top_k, scores). ``value`` holds the
@@ -62,7 +95,7 @@ class ParameterNode(Node):
 
     name: str = ""
     derivation: Literal["full", "query", "search"] = "full"
-    backend: MemoryBackend | None = field(default=None, repr=False)
+    backend: ParameterHost | None = field(default=None, repr=False)
     description: str = ""
     procedural: bool = False
     meta: dict[str, Any] = field(default_factory=dict)

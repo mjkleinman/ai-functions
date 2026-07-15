@@ -25,9 +25,9 @@ from ..types.graph import ParameterNode, Result, ThreadNode, ToolCallNode
 from ._formatting import unique_name
 
 if TYPE_CHECKING:
-    from ..memory.base import MemoryBackend
     from ..protocols import Coordinator
     from ..types.events import Event
+    from ..types.graph import ParameterHost
     from ..types.ids import ThreadId
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,8 @@ def leads_to_grad_parameter(node: ThreadNode, _cache: dict[int, bool] | None = N
         return cache[nid]
     # Seed the cache before recursing so a cycle back to ``node`` terminates.
     cache[nid] = False
+    # An economic-function run is kept because it owns a grad-enabled decision
+    # parameter (its beliefs host), so no learnable-node special case is needed.
     result = any(p.requires_grad for p in node.parameters) or any(
         leads_to_grad_parameter(c, cache) for c in node.child_threads
     )
@@ -99,7 +101,7 @@ def _decode_result_payload(payload: str) -> Any:  # pyright: ignore[reportExplic
         return payload
 
 
-def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> ThreadNode:
+def _reconstruct_node(events: list[Event], backends: list[ParameterHost]) -> ThreadNode:
     """Reconstruct one thread's computation node from its event log.
 
     Builds exactly one ``ThreadNode`` from a single thread's pre-fetched events.
@@ -108,7 +110,7 @@ def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> Thr
 
     Args:
         events: One thread's events in append order (oldest first).
-        backends: Live memory backends, matched by ``backend_id``.
+        backends: Live parameter hosts (memory backends, beliefs adapters), matched by ``backend_id``.
 
     Returns:
         A single childless ``ThreadNode``.
@@ -203,10 +205,33 @@ def _reconstruct_node(events: list[Event], backends: list[MemoryBackend]) -> Thr
     )
 
 
+def _splice_delegated_traces(node: ThreadNode) -> None:
+    """Splice each delegated child's messages onto ``node`` at its marker.
+
+    A supervisor thread (an economic run, a retry wrapper) emits a
+    :class:`~ai_functions.types.events.TraceDelegationEvent` naming the child
+    whose conversation the backward pass should read instead of the
+    supervisor's telemetry. This appends that child's reconstructed messages to
+    the node's own — any narration the supervisor logged as ordinary messages
+    stays in order, and the delegated conversation follows. A marker whose child
+    is not among ``child_threads`` (never spawned, or pruned) contributes
+    nothing. Called after ``child_threads`` are wired; a no-op with no markers.
+    """
+    from ..types.events import TraceDelegationEvent
+
+    by_id = {c.thread_id: c for c in node.child_threads}
+    for evt in node.events:
+        if not isinstance(evt, TraceDelegationEvent):
+            continue
+        child = by_id.get(str(evt.child_thread_id))
+        if child is not None:
+            node.messages = [*node.messages, *child.messages]
+
+
 async def build_graph(
     coordinator: Coordinator,
     thread_id: ThreadId,
-    backends: list[MemoryBackend],
+    backends: list[ParameterHost],
 ) -> ThreadNode:
     """Reconstruct a thread's computation graph, recursing into spawned children.
 
@@ -219,7 +244,7 @@ async def build_graph(
     Args:
         coordinator: Coordinator holding the event logs.
         thread_id: Root thread to reconstruct.
-        backends: Live memory backends, matched by ``backend_id``.
+        backends: Live parameter hosts (memory backends, beliefs adapters), matched by ``backend_id``.
 
     Returns:
         The root ``ThreadNode`` with its spawned-child subtree attached.
@@ -230,7 +255,7 @@ async def build_graph(
 async def _build_subtree(
     coordinator: Coordinator,
     thread_id: ThreadId,
-    backends: list[MemoryBackend],
+    backends: list[ParameterHost],
     seen: set[str],
 ) -> ThreadNode:
     """Build ``thread_id``'s node and recurse its spawned children.
@@ -249,12 +274,13 @@ async def _build_subtree(
             child.parent = node
             children.append(child)
     node.child_threads = children
+    _splice_delegated_traces(node)
     return node
 
 
 async def build_graph_from_result(
     result: Result[Any],  # pyright: ignore[reportExplicitAny]
-    backends: list[MemoryBackend],
+    backends: list[ParameterHost],
 ) -> ThreadNode:
     """Build the full ``ThreadNode`` graph from a traced :class:`Result`.
 
@@ -274,7 +300,7 @@ async def build_graph_from_result(
 
     Args:
         result: The root ``Result`` returned by ``AIFunction.trace``.
-        backends: Live memory backends, matched by ``backend_id``.
+        backends: Live parameter hosts (memory backends, beliefs adapters), matched by ``backend_id``.
 
     Returns:
         The root ``ThreadNode`` with spawned and sibling subtrees attached.
@@ -296,7 +322,7 @@ def _register_subtree(node: ThreadNode, built: dict[str, ThreadNode]) -> None:
 
 async def _assemble(
     result: Result[Any],  # pyright: ignore[reportExplicitAny]
-    backends: list[MemoryBackend],
+    backends: list[ParameterHost],
     built: dict[str, ThreadNode],
 ) -> ThreadNode:
     """Build (or reuse) ``result``'s node and graft its sibling ``Result`` inputs."""

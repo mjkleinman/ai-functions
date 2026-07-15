@@ -502,9 +502,7 @@ class ContextFitter:
         if self._attempts >= self._max_attempts:
             raise SummarizationFailedError(
                 function_name=self._function_name,
-                reason=(
-                    f"Context window still overflowed after {self._max_attempts} summarization attempts: {exc}"
-                ),
+                reason=(f"Context window still overflowed after {self._max_attempts} summarization attempts: {exc}"),
             ) from exc
         self._attempts += 1
         fresh_events = await ctx.coordinator.get_events(ctx.thread_id)

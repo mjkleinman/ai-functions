@@ -159,8 +159,7 @@ class LocalPythonExecutorTool:
             from smolagents.local_python_executor import LocalPythonExecutor
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
             raise ImportError(
-                "LocalPythonExecutorTool requires the 'smolagents' package. "
-                "Install it with: pip install smolagents"
+                "LocalPythonExecutorTool requires the 'smolagents' package. Install it with: pip install smolagents"
             ) from exc
 
         assert issubclass(output_type, BaseModel)
