@@ -6,6 +6,7 @@ Strands AI Functions is a Python library built around a new abstraction: functio
 - **[Native Python objects](#native-python-objects)**: agents can dynamically generate and execute code, so an AI Function can take and return real Python values (a `DataFrame`, not a JSON blob).
 - **[Just functions](#composing-functions)**: run them in parallel with `asyncio.gather`, pass them to other agents as tools, and share them as ordinary Python libraries.
 - **[Stateful threads and teams](#stateful-ai-threads)**: spawn a function into a live **AI Thread** that keeps its history; run several threads on a coordinator and let them discover and message each other.
+- **[One team, many runtimes](#threads-are-a-protocol-claude-code-kiro-or-your-own)**: threads implement a common protocol, so any agent runtime can join a team; wrappers for Claude Code and Kiro ship in the box and are discovered, messaged, and orchestrated exactly like native threads.
 - **[Distributed by a one-line change](#distributed-operation)**: swap the in-process coordinator for a client, and the same code runs across processes and machines.
 - **[Memory and optimization](#memory--optimization)**: backpropagation-style natural-language feedback updates the prompts, facts, and code your workflow relies on, so it continuously improves.
 
@@ -259,6 +260,29 @@ if __name__ == "__main__":
 ```
 
 `send_message` supports three modes: `"wait"` (block on the peer's reply), `"fire_and_forget"` (schedule and return immediately), and `"continue_then_receive"` (dispatch, end the current cycle, and resume automatically when the reply arrives). Children spawned with `parent_id` have their token usage roll up to the parent, and every turn, tool call, and lifecycle transition is available as an event stream via `coordinator.on(...)`. Orchestration logic that is not naturally expressed as a single prompt can be written as a custom **Spawnable**: a plain-Python workflow that runs as a thread and spawns AI subagents of its own. See the [tutorial](docs/tutorial.md) for all of these.
+
+## Threads Are a Protocol: Claude Code, Kiro, or Your Own
+
+An AI Function is only one implementation of the thread contract. Anything that implements the small `Spawnable` protocol can be hosted by a worker, and every implementation gets the full runtime surface: peers discover it with `list_threads` and delegate to it with `send_message`, orchestrators drive it through the same handle and lifecycle, its activity streams into the same event log, and post-conditions validate its results. The library ships two implementations that wrap external agent runtimes: `ClaudeAgent` runs a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session (via the Claude Agent SDK) and `KiroAgent` runs a [Kiro](https://kiro.dev) session (via the Agent Client Protocol). The external runtime keeps its own conversation and tools; to the rest of the team, it is a thread like any other.
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions
+
+from ai_functions.claude_code import ClaudeAgent
+from ai_functions.runtime import InMemoryCoordinator, LocalWorker
+
+coord = InMemoryCoordinator()
+worker = await LocalWorker(coord).register()
+
+# A Claude Code session as a thread, next to the AI Functions from the previous section.
+coder = await worker.spawn_locally(ClaudeAgent(options=ClaudeAgentOptions()), thread_name="coder")
+_ = await coord.spawn(researcher, thread_name="researcher")
+
+# Same handle API, same events, same peer messaging.
+result = await coder.run("Profile src/parser.py and fix the hot spot. Ask `researcher` for the algorithm.")
+```
+
+The Claude session is even given the coordinator's `list_threads` / `send_message` tools (bridged in over MCP), so it can delegate to its teammates on its own, exactly like a native thread. Backends ship as extras (`pip install 'strands-ai-functions[claude-code]'` or `[kiro]`); see the [tutorial](docs/tutorial.md#threads-as-a-protocol-claude-code-and-kiro) and the runnable `examples/integrate_claude_code.py` and `examples/integrate_kiro.py`.
 
 ## Distributed Operation
 

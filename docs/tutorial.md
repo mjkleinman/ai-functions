@@ -19,6 +19,7 @@ Because AI Functions *are* functions, developers can construct agentic workflows
 - [Parallel workflows](#parallel-workflows)
 - [AI Threads: adding state](#ai-threads-adding-state)
 - [Teams of agents: the coordinator and workers](#teams-of-agents-the-coordinator-and-workers)
+- [Threads as a protocol: Claude Code and Kiro](#threads-as-a-protocol-claude-code-and-kiro)
 - [Events and observability](#events-and-observability)
 - [Memory and optimization](#memory-and-optimization)
 - [Economics-aware execution](#economics-aware-execution)
@@ -789,6 +790,48 @@ sequenceDiagram
 Application code has an equivalent, code-facing side channel: `handle.notify(text)`, described in [AI Threads](#ai-threads-adding-state), routes out-of-band context to any registered thread without starting a cycle.
 
 For a complete runnable example exercising all three `send_message` modes, see `examples/team_two_workers_local.py`.
+
+## Threads as a protocol: Claude Code and Kiro
+
+The threads on a coordinator do not all have to be AI Functions. A thread is a generic contract: any object implementing the `Spawnable` protocol (a factory producing a live thread; see [Going further](#going-further)) can be hosted by a worker, which is how foreign agent runtimes gain interoperability with everything in the previous sections. The library ships two such implementations:
+
+- **`ClaudeAgent`** (`ai_functions.claude_code`) drives a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session through the Claude Agent SDK. Requires the `claude-code` extra: `pip install 'strands-ai-functions[claude-code]'`.
+- **`KiroAgent`** (`ai_functions.kiro`) drives a [Kiro](https://kiro.dev) session over the Agent Client Protocol (ACP). Requires the `kiro` extra and the `kiro-cli` binary on your `PATH`.
+
+In both cases the external runtime owns the conversation and its own tools (file access, shell, editing); the library observes the session and re-emits everything it does as standard events. To the coordinator, an external-backend thread is a thread like any other. The whole runtime surface from the previous sections applies unchanged:
+
+- peers discover it with `list_threads` and delegate to it with `send_message`;
+- an orchestrator drives it through the same `ThreadHandle` (`run`, `notify`, lifecycle control);
+- its turns, tool calls, and token usage stream into the same event log (`coordinator.on(...)`, `get_events`);
+- `post_conditions` on the template validate each result, with the same self-correcting retry loop AI Functions use.
+
+Spawning one looks exactly like spawning an AI Function, except the template is constructed rather than decorated:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions
+
+from ai_functions.claude_code import ClaudeAgent
+from ai_functions.runtime import InMemoryCoordinator, LocalWorker
+
+coord = InMemoryCoordinator()
+worker = await LocalWorker(coord).register()
+
+template = ClaudeAgent(options=ClaudeAgentOptions(), name="coder")
+handle = await worker.spawn_locally(template, thread_name="coder")
+
+result = await handle.run("Find the three .md files in this directory and summarize the project.")
+```
+
+`spawn_locally` hosts the thread on this worker without serializing the template across the wire, which is the natural choice for a thread that drives a local subprocess. A `KiroAgent` spawns the same way (`KiroAgent(name="kiro")`; see its `executable` and `auto_approve` options).
+
+Two practical notes:
+
+- **Permissions.** Both runtimes ask for approval before running tools. Non-interactive scripts can bypass this (`ClaudeAgentOptions(permission_mode="bypassPermissions")`; `KiroAgent(auto_approve=True)`, the default); otherwise approval requests are routed through the thread's interrupt channel. Only bypass approvals in trusted environments.
+- **Delegation from inside the session.** A `ClaudeAgent` session is also given the coordinator's `list_threads` / `send_message` tools, bridged in over MCP, so the Claude session can discover teammates and delegate to them on its own, exactly like a native thread.
+
+See `examples/integrate_claude_code.py` and `examples/integrate_kiro.py` for complete runnable versions, including rendering the event stream of an external session.
+
+Wrapping a foreign runtime is one use of the protocol; the same contract also admits plain-Python workflows that run as threads and orchestrate AI subagents of their own — see [Going further](#going-further) and the [architecture documentation](architecture.md#custom-spawnables) for implementing your own.
 
 ## Events and observability
 
