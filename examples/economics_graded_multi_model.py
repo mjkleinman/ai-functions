@@ -10,9 +10,9 @@ attempt's cost.
 The per-model indices come from a calibration phase: try each model a few
 times outside the search, grade each report, and keep the empirical reward
 distribution and average cost. Each index is computed from that
-distribution and cost; the search tries the highest index first and stops
-when the best in hand beats every remaining index — Weitzman's
-Pandora's-box rule.
+distribution and cost; the search repeatedly tries the highest remaining
+index and stops when the best in hand beats every remaining index —
+Weitzman's Pandora's box rule.
 """
 
 import asyncio
@@ -20,7 +20,7 @@ import logging
 from collections import Counter
 
 from _buggy_c import BUGGY_C, PLANTED
-from _economics_models import HAIKU, SONNET
+from _economics_utils import HAIKU, SONNET
 from _utils import display, rule
 from pydantic import BaseModel, Field
 

@@ -45,8 +45,10 @@ differences, so each attempt's reward is its marginal gain)."""
 
 
 def keep_best[T](value: Callable[[T], float]) -> Callable[[T, T], T]:
-    """The keep-the-best fold: a new result replaces the incumbent only by
-    scoring strictly higher under ``value``. ``@economic``'s default merge.
+    """The keep-the-best fold, ``@economic``'s default merge.
+
+    A new result replaces the incumbent only by scoring strictly higher
+    under ``value``.
 
     Args:
         value: The same dollar-worth function passed to the decorator.

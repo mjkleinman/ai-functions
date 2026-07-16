@@ -17,8 +17,7 @@ import asyncio
 import logging
 import math
 
-from _economics_models import HAIKU, SONNET
-from _sat import check_sat, format_instance, make_instance
+from _economics_utils import HAIKU, SONNET, check_sat, format_instance, make_instance
 from _utils import display, rule
 from pydantic import BaseModel, Field
 

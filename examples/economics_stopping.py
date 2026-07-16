@@ -19,7 +19,7 @@ import asyncio
 import logging
 
 from _buggy_c import BUGGY_C, PLANTED
-from _economics_models import HAIKU
+from _economics_utils import HAIKU
 from _utils import display, rule
 from pydantic import BaseModel, Field
 

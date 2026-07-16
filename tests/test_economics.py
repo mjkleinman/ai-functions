@@ -24,8 +24,8 @@ from ai_functions.experimental.economics import (
     TaskView,
     attempts,
     decisions,
-    routed,
     economic,
+    routed,
     spend,
 )
 from ai_functions.experimental.economics.search import (
@@ -371,7 +371,12 @@ class TestConstruction:
         # A per-candidate cap under merge is the classic Pandora setup
         # (each box opened a bounded number of times), not a conflict.
         fn = EconomicFunction(
-            self._cand(), value=lambda r: 0.10, beliefs=DiminishingReturns(), merge=lambda a, b: a, budget=0.1, max_tries=3
+            self._cand(),
+            value=lambda r: 0.10,
+            beliefs=DiminishingReturns(),
+            merge=lambda a, b: a,
+            budget=0.1,
+            max_tries=3,
         )
         assert fn._max_tries == 3
 
@@ -811,7 +816,10 @@ class TestDecorators:
         with pytest.raises(ValueError, match="positive budget"):
 
             @economic(
-                models=[PricedModel(model="m", prices=CHEAP_PRICES)], value=lambda r: 1.0, merge=lambda a, b: a, budget=0.0
+                models=[PricedModel(model="m", prices=CHEAP_PRICES)],
+                value=lambda r: 1.0,
+                merge=lambda a, b: a,
+                budget=0.0,
             )
             @ai_function[str](structured_output=False)
             def review(src: str) -> str:

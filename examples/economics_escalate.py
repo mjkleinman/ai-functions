@@ -7,15 +7,15 @@ profit is highest (the cheap model, at first), escalates when the verifier
 rejects its answer, stops when no attempt is worth its cost — and learns
 from every call, so routing sharpens as the batch progresses.
 
-A batch of 3-SAT instances — mostly easy, one hard (see ``_sat.py`` for the
-difficulty knob) — against a straight-to-strong baseline shows the savings in dollars.
+A batch of 3-SAT instances — mostly easy, one hard (see ``_economics_utils.py``
+for the difficulty knob) — against a straight-to-strong baseline shows the
+savings in dollars.
 """
 
 import asyncio
 import logging
 
-from _economics_models import HAIKU, SONNET
-from _sat import check_sat, format_instance, make_instance
+from _economics_utils import HAIKU, SONNET, check_sat, format_instance, make_instance
 from _utils import console, display, rule
 from pydantic import BaseModel, Field
 

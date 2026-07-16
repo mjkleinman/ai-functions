@@ -85,7 +85,7 @@ def routed[**P, T](
         max_tries: Attempts per candidate per call; ``None`` = unbounded
             (requires ``budget``).
         carry_context: Seed each escalation from the prior attempt's
-g            was rejected instead of starting fresh.
+    g            was rejected instead of starting fresh.
 
     Returns:
         A decorator producing the configured ``EconomicFunction``.

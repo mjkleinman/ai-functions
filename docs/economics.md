@@ -39,8 +39,8 @@ SONNET = PricedModel(model="global.anthropic.claude-sonnet-4-6",
 # A solved instance is worth 50 cents to us; check_sat is an ordinary
 # post-condition that verifies the assignment against the clauses.
 @routed(models=[HAIKU, SONNET], value=0.50)
-@ai_function[Assignment](post_conditions=[check_sat])
-def solve(clauses: str, n_vars: int):
+@ai_function(post_conditions=[check_sat])
+def solve(clauses: str, n_vars: int) -> Assignment:
     """Find a satisfying assignment for this 3-SAT formula over variables x1..x{n_vars}.
 
     {clauses}"""
@@ -55,7 +55,7 @@ Three pieces define the economics, and each is doing a specific job:
 - **`models`** are the candidates, each a `PricedModel` pairing a model with the per-token prices you pay for it (`Prices` also accepts `cache_read`/`cache_write` rates, and an optional `description` that estimators can read).
 - **The post-conditions define success.** They are the verifier that decides whether an attempt passed; without them, the cheap model would always "succeed" and there would be nothing to escalate on.
 
-A call then works as follows: the function estimates, per candidate, the probability of passing and the expected cost; tries the candidate with the best expected profit; returns its result if it passes; switches to the next candidate if it fails; and abstains — raising `Abstained` rather than knowingly wasting money — when no candidate is worth its cost. The cost of every attempt is *measured* from its event log at the candidate's token prices, not estimated.
+A call then works as follows: the probability of passing and the expected cost are estimated per candidate; the search tries the candidate with the best expected profit; returns its result if it passes; switches to the next candidate if it fails; and abstains — raising `Abstained` rather than knowingly wasting money — when no candidate is worth its cost. The cost of every attempt is *measured* from its event log at the candidate's token prices, not estimated.
 
 Routing learns by default. Out of the box, estimates come from `EmpiricalBeliefs`: per-candidate pass rates and average costs, starting from a uniform prior (so untried candidates get explored) and updated after every attempt. Over a batch of calls the cheap model keeps the tasks it handles and the strong model inherits the ones it doesn't. You can watch this happen:
 
@@ -95,8 +95,8 @@ memory = JSONMemoryBackend(schema=Memory, actor_id="demo", path="memory.json")
     beliefs=LLMForecaster(memory=memory, memory_key="research_routing"),
     budget=0.10,
 )
-@ai_function[Sources](tools=[web_search], post_conditions=[cited])
-def research(query: str):
+@ai_function(tools=[web_search], post_conditions=[cited])
+def research(query: str) -> Sources:
     """Research this topic on the web and return the key findings with sources:
 
     {query}"""
@@ -149,8 +149,8 @@ def merge_reports(running: Report, new: Report) -> Report:
     merge=merge_reports,
     budget=0.10,
 )
-@ai_function[Report](post_conditions=[at_least_one])
-def review(source: str):
+@ai_function(post_conditions=[at_least_one])
+def review(source: str) -> Report:
     """You are reviewing this C module. Report any real bugs you find ..."""
 ```
 
@@ -160,7 +160,7 @@ The `@economic` decorator covers several familiar search shapes:
 
 - **Keep the best.** Omit `merge` and it defaults to `keep_best(value)`: the search keeps sampling, a new result replaces the incumbent only by scoring strictly higher, and the best is returned — best-of-n, except n is not chosen: each redraw happens only while it is expected to be worth its cost. Note that a draw that fails to beat the incumbent books $0, which ends the search under the default belief.
 - **Accumulation.** Pass a `merge` that folds results together, as in the review above: overlap with earlier draws books $0, so gains shrink as the pool depletes and the search stops itself.
-- **Multiple models.** Pass several `models` and each round draws whichever currently promises the most. With the default beliefs the arms share one projected gain curve, so they are not meaningfully differentiated — supply per-arm `beliefs` if the arms differ in character. `examples/economics_graded_multi_model.py` shows one way: calibrate each model with a few graded attempts to build an empirical reward distribution and average cost per model, and the search runs the Pandora's-box rule over distinct arms.
+- **Multiple models.** Pass several `models` and each round draws whichever currently promises the most. With the default beliefs the arms share one projected gain curve, so they are not meaningfully differentiated — supply per-arm `beliefs` if the arms differ in character. `examples/economics_graded_multi_model.py` shows one way: calibrate each model with a few graded attempts to build an empirical reward distribution and average cost per model, and the search runs the Pandora's box rule over distinct arms.
 
 See `examples/economics_stopping.py` for the review search run against a C module with planted defects, printing each pass's marginal gain against its cost.
 
@@ -225,6 +225,6 @@ Every attempt runs as a child thread and emits durable events, so `spend` gives 
 | `economics_route.py` | A custom task-dependent `Beliefs`; `plan()` previews each decision |
 | `economics_stopping.py` | `@economic`: marginal-gain bookkeeping and adaptive stopping on a code review with planted defects |
 | `economics_workflow.py` | Two routed stages in a pipeline; `LLMForecaster`, persistence, and feedback settling both stages via `optimizer.step` |
-| `economics_graded_multi_model.py` | `@economic` over two models with per-arm beliefs: calibrate each model's reward distribution and average cost, then keep the best graded report under the Pandora's-box rule |
+| `economics_graded_multi_model.py` | `@economic` over two models with per-arm beliefs: calibrate each model's reward distribution and average cost, then search for the best graded result using the Pandora's box rule |
 
 Run any of them from the `examples/` folder with `uv run economics_<name>.py`.

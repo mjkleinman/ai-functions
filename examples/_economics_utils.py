@@ -1,18 +1,61 @@
-"""Random planted 3-SAT instances for the economics examples.
+"""Shared utilities for the economics examples: priced models and 3-SAT tasks.
 
-Instances are generated with a hidden planted assignment, so every instance
-is guaranteed satisfiable. Verification is pure Python — the post-condition
-checks every clause.
+**Priced models.** The library deliberately ships no price table — what a
+token costs depends on your contract, region, and provisioning. The prices
+below are ILLUSTRATIVE EXAMPLES ONLY and do not reflect any real price list:
+define your own ``PricedModel`` collection with the rates you actually pay.
+The models are built with an explicit ``max_tokens`` cap, bounding each
+attempt's cost and latency — and capping what a failure costs: when the
+cheap model misses a hard instance (a wrong answer, or output truncated at
+the cap), the failure is cheap, and the search can escalate to the stronger
+model.
 
-Difficulty is governed by the clause/variable ratio: low ratios leave many
-satisfying assignments; near ~4.3 — the random 3-SAT satisfiability phase
-transition — solutions become scarce and instances get hard, even though
-planting keeps them satisfiable.
+**Planted 3-SAT.** Instances are generated with a hidden planted assignment,
+so every instance is guaranteed satisfiable. Verification is pure Python —
+the post-condition checks every clause. Difficulty is governed by the
+clause/variable ratio: low ratios leave many satisfying assignments; near
+~4.3 — the random 3-SAT satisfiability phase transition — solutions become
+scarce and instances get hard, even though planting keeps them satisfiable.
 """
 
 from __future__ import annotations
 
 import random
+
+from strands.models import BedrockModel
+
+from ai_functions.experimental.economics import PricedModel, Prices
+
+# ── Priced models ─────────────────────────────────────────────────
+
+# Cap generation so a rambling cheap model fails fast (and cheap) rather than
+# burning tens of thousands of tokens on one hard instance.
+MAX_TOKENS = 8_000
+REGION = "us-west-2"
+
+HAIKU = PricedModel(
+    model=BedrockModel(
+        model_id="global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        max_tokens=MAX_TOKENS,
+        region_name=REGION,
+    ),
+    prices=Prices(input=1.00, output=5.00, cache_read=0.10, cache_write=1.25),
+    label="haiku",
+    description="Fast and cheap; handles straightforward tasks well",
+)
+
+SONNET = PricedModel(
+    model=BedrockModel(
+        model_id="global.anthropic.claude-sonnet-4-6",
+        max_tokens=MAX_TOKENS,
+        region_name=REGION,
+    ),
+    prices=Prices(input=3.00, output=15.00, cache_read=0.30, cache_write=3.75),
+    label="sonnet",
+    description="Balanced; strong at multi-step reasoning and constraints",
+)
+
+# ── Planted 3-SAT instances ───────────────────────────────────────
 
 # A clause is a list of (variable_index, is_positive) literals.
 Clause = list[tuple[int, bool]]

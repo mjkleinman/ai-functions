@@ -40,6 +40,7 @@ from ai_functions.types import (
     TokenUsage,
     TraceDelegationEvent,
 )
+
 from .beliefs import Beliefs
 from .search import Estimate, Policy, Search
 from .types import (
@@ -98,8 +99,10 @@ def _value_of(value: Value, result: Any) -> float:
 
 
 def keep_best[T](value: Callable[[T], float]) -> Callable[[T, T], T]:
-    """The keep-the-best fold: a new result replaces the incumbent only by
-    scoring strictly higher under ``value``. ``@economic``'s default merge.
+    """The keep-the-best fold, ``@economic``'s default merge.
+
+    A new result replaces the incumbent only by scoring strictly higher
+    under ``value``.
 
     Args:
         value: The same dollar-worth function passed to the decorator.

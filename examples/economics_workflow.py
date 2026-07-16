@@ -26,7 +26,7 @@ host, so ``step`` takes each stage alongside the notes' memory backend.
 import asyncio
 import logging
 
-from _economics_models import HAIKU, SONNET
+from _economics_utils import HAIKU, SONNET
 from _utils import display, rule
 from pydantic import BaseModel, Field
 from strands import tool

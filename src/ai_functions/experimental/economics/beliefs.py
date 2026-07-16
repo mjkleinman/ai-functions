@@ -47,11 +47,13 @@ from ai_functions.ai_thread.ai_function import AIFunction, ai_function
 from ai_functions.ai_thread.errors import AIFunctionError
 from ai_functions.memory.frozen import Frozen
 from ai_functions.types import TokenUsage
+
 from .search import Bernoulli, Estimate, Gaussian
 from .types import AttemptRecord, RecordId, TaskView
 
 if TYPE_CHECKING:
     from ai_functions.memory.base import MemoryBackend
+
     from .types import Candidate
 
 logger = logging.getLogger(__name__)
