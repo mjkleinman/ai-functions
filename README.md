@@ -1,18 +1,46 @@
-# Strands AI Functions
+<div align="center">
+  <div>
+    <a href="https://strandsagents.com">
+      <img src="https://strandsagents.com/latest/assets/logo-github.svg" alt="Strands Agents" width="55px" height="105px">
+    </a>
+  </div>
+
+  <h1>
+    Strands AI Functions
+  </h1>
+
+  <p>
+    <b>Functions that think, learn, and self-correct. Welcome to programming with built-in intelligence.</b>
+  </p>
+
+  <div align="center">
+    <a href="https://python.org"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/strands-ai-functions"/></a>
+    <a href="https://pypi.org/project/strands-ai-functions/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/strands-ai-functions"/></a>
+    <a href="https://github.com/strands-labs/ai-functions/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/strands-labs/ai-functions"/></a>
+    <a href="https://github.com/strands-labs/ai-functions/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/strands-labs/ai-functions?style=flat"/></a>
+  </div>
+
+  <p>
+    <a href="docs/tutorial.md">Tutorial</a>
+    · <a href="examples/">Examples</a>
+    · <a href="docs/architecture.md">Architecture</a>
+    · <a href="https://strandsagents.com/">Strands Agents</a>
+  </p>
+</div>
+
+<hr>
 
 Strands AI Functions is a Python library built around a new abstraction: functions that behave like standard Python functions, but are evaluated by AI agents. The library develops this idea from a single verified call up to distributed teams of agents that improve run over run:
 
-- **[Don't prompt-and-pray](#post-conditions)**: declare *post-conditions* on a function and the library runs a self-correcting loop until the output satisfies them, preventing cascading errors in complex workflows.
-- **[Native Python objects](#native-python-objects)**: agents can dynamically generate and execute code, so an AI Function can take and return real Python values (a `DataFrame`, not a JSON blob).
-- **[Just functions](#composing-functions)**: run them in parallel with `asyncio.gather`, pass them to other agents as tools, and share them as ordinary Python libraries.
-- **[Stateful threads and teams](#stateful-ai-threads)**: spawn a function into a live **AI Thread** that keeps its history; run several threads on a coordinator and let them discover and message each other.
-- **[One team, many runtimes](#threads-are-a-protocol-claude-code-kiro-or-your-own)**: threads implement a common protocol, so any agent runtime can join a team; wrappers for Claude Code and Kiro ship in the box and are discovered, messaged, and orchestrated exactly like native threads.
-- **[Distributed by a one-line change](#distributed-operation)**: swap the in-process coordinator for a client, and the same code runs across processes and machines.
-- **[Memory and optimization](#memory--optimization)**: backpropagation-style natural-language feedback updates the prompts, facts, and code your workflow relies on, so it continuously improves.
+- **Don't prompt-and-pray** — Declare *post-conditions* on a function and the library runs a self-correcting loop until the output satisfies them, preventing cascading errors in complex workflows.
+- **Native Python objects** — Agents can dynamically generate and execute code, so an AI Function can take and return real Python values (a `DataFrame`, not a JSON blob).
+- **Just functions** — Run them in parallel with `asyncio.gather`, pass them to other agents as tools, and share them as ordinary Python libraries.
+- **Stateful threads and teams** — Spawn a function into a live **AI Thread** that keeps its history; run several threads on a coordinator and let them discover and message each other.
+- **One team, many runtimes** — Threads implement a common protocol, so any agent runtime can join a team; wrappers for Claude Code, Kiro and Codex ship in the box and are discovered, messaged, and orchestrated exactly like native threads.
+- **Natively distributed execution** — Swap the in-process coordinator for a client, and the same code runs across processes and machines.
+- **Memory and optimization** — Backpropagation-style natural-language feedback updates the prompts, facts, and code your workflow relies on, so it continuously improves.
 
 ## Getting Started
-
-Requires Python >= 3.12 (3.14+ recommended for native [t-string](https://peps.python.org/pep-0750/) support) and credentials for a supported model provider.
 
 ```bash
 # using pip
@@ -42,7 +70,8 @@ from ai_functions import ai_function
 
 @ai_function
 def translate_text(text: str, lang: str) -> str:
-    """Translate the text below to the following language: {lang}.
+    """
+    Translate the text below to the following language: {lang}.
     ---
     {text}
     """
@@ -263,7 +292,7 @@ if __name__ == "__main__":
 
 ## Threads Are a Protocol: Claude Code, Kiro, or Your Own
 
-An AI Function is only one implementation of the thread contract. Anything that implements the small `Spawnable` protocol can be hosted by a worker, and every implementation gets the full runtime surface: peers discover it with `list_threads` and delegate to it with `send_message`, orchestrators drive it through the same handle and lifecycle, its activity streams into the same event log, and post-conditions validate its results. The library ships two implementations that wrap external agent runtimes: `ClaudeAgent` runs a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session (via the Claude Agent SDK) and `KiroAgent` runs a [Kiro](https://kiro.dev) session (via the Agent Client Protocol). The external runtime keeps its own conversation and tools; to the rest of the team, it is a thread like any other.
+An AI Function is only one implementation of the thread contract. Anything that implements the small `Spawnable` protocol can be hosted by a worker, and every implementation gets the full runtime surface: peers discover it with `list_threads` and delegate to it with `send_message`, orchestrators drive it through the same handle and lifecycle, its activity streams into the same event log, and post-conditions validate its results. The library ships three implementations that wrap external agent runtimes: `ClaudeAgent` runs a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session (via the Claude Agent SDK), `KiroAgent` runs a [Kiro](https://kiro.dev) session (via the Agent Client Protocol), and `CodexAgent` runs a [Codex](https://developers.openai.com/codex) session (via the Codex SDK). The external runtime keeps its own conversation and tools; to the rest of the team, it is a thread like any other.
 
 ```python
 from claude_agent_sdk import ClaudeAgentOptions
@@ -282,7 +311,7 @@ _ = await coord.spawn(researcher, thread_name="researcher")
 result = await coder.run("Profile src/parser.py and fix the hot spot. Ask `researcher` for the algorithm.")
 ```
 
-The Claude session is even given the coordinator's `list_threads` / `send_message` tools (bridged in over MCP), so it can delegate to its teammates on its own, exactly like a native thread. Backends ship as extras (`pip install 'strands-ai-functions[claude-code]'` or `[kiro]`); see the [tutorial](docs/tutorial.md#threads-as-a-protocol-claude-code-and-kiro) and the runnable `examples/integrate_claude_code.py` and `examples/integrate_kiro.py`.
+The Claude and Codex sessions are even given the coordinator's `list_threads` / `send_message` tools (bridged in over MCP), so they can delegate to their teammates on their own, exactly like a native thread. Backends ship as extras (`pip install 'strands-ai-functions[claude-code]'`, `[kiro]`, or `[codex]`); see the [tutorial](docs/tutorial.md#threads-as-a-protocol-claude-code-kiro-and-codex) and the runnable `examples/integrate_claude_code.py` and `examples/integrate_kiro.py`.
 
 ## Distributed Operation
 
@@ -329,7 +358,7 @@ $ ai-functions attach thread-a3f2          # open a live TUI for the thread
 
 See the [tutorial](docs/tutorial.md#running-agents-across-processes) for writing agent scripts with `ai_functions.serve`.
 
-## Memory & Optimization
+## Memory and Optimization
 
 Just as PyTorch or JAX optimize parameters via backpropagation through a computation graph, AI Functions optimize agentic workflows via natural-language feedback propagation. Named parameters (prompt fragments, learned facts, or reusable Python code) live in a pluggable *memory backend* and are passed to functions as ordinary arguments. After a run, feedback attached to the output is propagated backward through the *computation graph* of the calls that produced it, and an *optimizer* updates only the parameters responsible:
 

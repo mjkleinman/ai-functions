@@ -19,7 +19,7 @@ Because AI Functions *are* functions, developers can construct agentic workflows
 - [Parallel workflows](#parallel-workflows)
 - [AI Threads: adding state](#ai-threads-adding-state)
 - [Teams of agents: the coordinator and workers](#teams-of-agents-the-coordinator-and-workers)
-- [Threads as a protocol: Claude Code and Kiro](#threads-as-a-protocol-claude-code-and-kiro)
+- [Threads as a protocol: Claude Code, Kiro, and Codex](#threads-as-a-protocol-claude-code-kiro-and-codex)
 - [Events and observability](#events-and-observability)
 - [Memory and optimization](#memory-and-optimization)
 - [Economics-aware execution](#economics-aware-execution)
@@ -791,14 +791,15 @@ Application code has an equivalent, code-facing side channel: `handle.notify(tex
 
 For a complete runnable example exercising all three `send_message` modes, see `examples/team_two_workers_local.py`.
 
-## Threads as a protocol: Claude Code and Kiro
+## Threads as a protocol: Claude Code, Kiro, and Codex
 
-The threads on a coordinator do not all have to be AI Functions. A thread is a generic contract: any object implementing the `Spawnable` protocol (a factory producing a live thread; see [Going further](#going-further)) can be hosted by a worker, which is how foreign agent runtimes gain interoperability with everything in the previous sections. The library ships two such implementations:
+The threads on a coordinator do not all have to be AI Functions. A thread is a generic contract: any object implementing the `Spawnable` protocol (a factory producing a live thread; see [Going further](#going-further)) can be hosted by a worker, which is how foreign agent runtimes gain interoperability with everything in the previous sections. The library ships three such implementations:
 
 - **`ClaudeAgent`** (`ai_functions.claude_code`) drives a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session through the Claude Agent SDK. Requires the `claude-code` extra: `pip install 'strands-ai-functions[claude-code]'`.
 - **`KiroAgent`** (`ai_functions.kiro`) drives a [Kiro](https://kiro.dev) session over the Agent Client Protocol (ACP). Requires the `kiro` extra and the `kiro-cli` binary on your `PATH`.
+- **`CodexAgent`** (`ai_functions.codex`) drives an [OpenAI Codex](https://developers.openai.com/codex) session through the Codex SDK, which manages the `codex app-server` subprocess. Requires the `codex` extra: `pip install 'strands-ai-functions[codex]'`.
 
-In both cases the external runtime owns the conversation and its own tools (file access, shell, editing); the library observes the session and re-emits everything it does as standard events. To the coordinator, an external-backend thread is a thread like any other. The whole runtime surface from the previous sections applies unchanged:
+In every case the external runtime owns the conversation and its own tools (file access, shell, editing); the library observes the session and re-emits everything it does as standard events. To the coordinator, an external-backend thread is a thread like any other. The whole runtime surface from the previous sections applies unchanged:
 
 - peers discover it with `list_threads` and delegate to it with `send_message`;
 - an orchestrator drives it through the same `ThreadHandle` (`run`, `notify`, lifecycle control);
@@ -822,12 +823,12 @@ handle = await worker.spawn_locally(template, thread_name="coder")
 result = await handle.run("Find the three .md files in this directory and summarize the project.")
 ```
 
-`spawn_locally` hosts the thread on this worker without serializing the template across the wire, which is the natural choice for a thread that drives a local subprocess. A `KiroAgent` spawns the same way (`KiroAgent(name="kiro")`; see its `executable` and `auto_approve` options).
+`spawn_locally` hosts the thread on this worker without serializing the template across the wire, which is the natural choice for a thread that drives a local subprocess. A `KiroAgent` spawns the same way (`KiroAgent(name="kiro")`; see its `executable` and `auto_approve` options), as does a `CodexAgent` (`CodexAgent(name="codex")`; see its `model`, `sandbox`, and `cwd` options, plus `resume_thread_id` / `fork_of_thread_id` for continuing or branching a stored Codex thread).
 
 Two practical notes:
 
-- **Permissions.** Both runtimes ask for approval before running tools. Non-interactive scripts can bypass this (`ClaudeAgentOptions(permission_mode="bypassPermissions")`; `KiroAgent(auto_approve=True)`, the default); otherwise approval requests are routed through the thread's interrupt channel. Only bypass approvals in trusted environments.
-- **Delegation from inside the session.** A `ClaudeAgent` session is also given the coordinator's `list_threads` / `send_message` tools, bridged in over MCP, so the Claude session can discover teammates and delegate to them on its own, exactly like a native thread.
+- **Permissions.** All three runtimes gate tool use. Non-interactive scripts can bypass or pre-resolve this (`ClaudeAgentOptions(permission_mode="bypassPermissions")`; `KiroAgent(auto_approve=True)`, the default; `CodexAgent(approval_mode=ApprovalMode.auto_review)`, the default, which lets Codex's own reviewer arbitrate). Claude Code and Kiro route approval requests through the thread's interrupt channel; the Codex SDK exposes no human-in-the-loop callback, so its escalations are resolved by `approval_mode` alone and `CodexAgent(sandbox=...)` is the knob that bounds filesystem access. Only bypass approvals in trusted environments.
+- **Delegation from inside the session.** `ClaudeAgent` and `CodexAgent` sessions are also given the coordinator's `list_threads` / `send_message` tools, so they can discover teammates and delegate to them on their own, exactly like a native thread. Claude Code gets them from an in-process SDK MCP server; Codex reaches them over HTTP MCP, with each thread starting its own `CoordinatorToolServer`.
 
 See `examples/integrate_claude_code.py` and `examples/integrate_kiro.py` for complete runnable versions, including rendering the event stream of an external session.
 
