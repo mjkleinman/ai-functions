@@ -41,7 +41,7 @@ from ai_functions.types import (
 )
 
 from .beliefs import Beliefs
-from .search import Estimate, Policy, Search
+from .search import Policy, ReservationPricePolicy, RewardCostEstimate, RewardDistribution, Search
 from .types import (
     Abstained,
     AttemptRecord,
@@ -323,10 +323,7 @@ class EconomicThread[**P, T]:
             return 1.0
         score = float(fn._scorer(result))
         if not 0.0 <= score <= 1.0:
-            raise ValueError(
-                f"score must be in [0, 1], got {score} from the score function of {fn.name!r}; "
-                "return a normalized score (e.g. F1), not a dollar amount"
-            )
+            raise ValueError(f"score must be in [0, 1], got {score} from the score function of {fn.name!r}")
         return score
 
     async def _task_view(self, candidate: Candidate[P, T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> TaskView:
@@ -340,25 +337,30 @@ class EconomicThread[**P, T]:
         task: TaskView,
         candidates: list[Candidate[P, T]],
         history: list[AttemptRecord],
-    ) -> dict[str, Estimate]:
-        """Call the beliefs estimator; guarantee an estimate for every candidate (E4).
+    ) -> dict[str, RewardCostEstimate]:
+        """Call the beliefs estimator and price its scores (E1, E4).
 
-        The scale passed is the declared constant ``value`` — the dollars a
-        fully-successful (score 1.0) result is worth. Beliefs price each
-        candidate's expected reward as ``value * E[score]``.
+        Beliefs return a :class:`~.search.ScoreCostEstimate` per candidate — a
+        score distribution on ``[0, 1]`` plus its expected dollar cost.
+        Applying ``value`` here, once, is what lets the search and every policy
+        compare in dollars.
         """
-        estimates = await fn._beliefs.estimate(task, cast("list[Candidate]", candidates), float(fn._value), history)
+        value = float(fn._value)
+        estimates = await fn._beliefs.estimate(task, cast("list[Candidate]", candidates), history)
         missing = [c.label for c in candidates if c.label not in estimates]
         if missing:
             raise AIFunctionError(f"beliefs returned no estimate for {missing}", function_name=fn.name)
-        return estimates
+        return {
+            label: RewardCostEstimate(reward_dist=RewardDistribution(est.score_dist, value), cost=est.cost)
+            for label, est in estimates.items()
+        }
 
     def _emit_decision(
         self,
         ctx: ThreadContext,
         search: Search,
         records: list[AttemptRecord],
-        estimates: dict[str, Estimate],
+        estimates: dict[str, RewardCostEstimate],
         rounds: list[dict[str, Any]],
     ) -> None:
         """Emit a ``DECISION_EVENT`` and append its payload to ``rounds``.
@@ -375,7 +377,9 @@ class EconomicThread[**P, T]:
             "ranking": [
                 {"label": r.label, "reservation_price": r.reservation_price, "net_value": r.net_value} for r in ranking
             ],
-            "estimates": {label: {"expected_reward": e.dist.mean(), "cost": e.cost} for label, e in estimates.items()},
+            "estimates": {
+                label: {"expected_reward": e.reward_dist.mean(), "cost": e.cost} for label, e in estimates.items()
+            },
             "stats": dict(stats),
             "record_ids": [r.id for r in records],
         }
@@ -508,10 +512,9 @@ class EconomicFunction[**P, T]:
             ``value * score``.
         beliefs: Estimate/learn provider consulted per call.
         budget: Hard dollar cap per call; ``None`` = no cap.
-        policy: Search policy; ``None`` uses the ``Search`` default. The
-            decorator sets ``ReservationPricePolicy`` (Weitzman), which
-            samples while a candidate's reservation price beats the best
-            reward in hand and keeps the best result by score.
+        policy: Search policy; defaults to ``ReservationPricePolicy``
+            (Weitzman), which samples while a candidate's reservation price
+            beats the best reward in hand and keeps the best result by score.
         max_tries: Attempts per candidate per call; ``None`` = unbounded
             (requires ``budget``). The default 1 is Weitzman's classic
             open-each-box-at-most-once; ``None`` is open-ended repeated
@@ -549,7 +552,7 @@ class EconomicFunction[**P, T]:
         self._value = value
         self._beliefs = beliefs
         self._budget = budget
-        self._policy = policy
+        self._policy: Policy = policy if policy is not None else ReservationPricePolicy()
         self._scorer = scorer
         self._max_tries = max_tries
 
@@ -711,7 +714,7 @@ class EconomicFunction[**P, T]:
         return decision
 
     def _make_reporter(
-        self, candidate: Candidate[P, T] | None, task: TaskView, estimate: Estimate | None
+        self, candidate: Candidate[P, T] | None, task: TaskView, estimate: RewardCostEstimate | None
     ) -> Callable[[Any, float | None], None]:
         """Build the closure ``Decision.report`` calls to book an external attempt."""
         # Unique per plan() call, like the run path's thread-id prefix:

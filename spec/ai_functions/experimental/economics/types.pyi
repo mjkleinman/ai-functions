@@ -1,13 +1,9 @@
 """Data types for the economics module.
 
-Every quantity in this module is denominated in dollars. Rewards, costs,
-budgets, and reservation prices share one currency, so no exchange-rate
-parameter (a ``lambda_``) exists anywhere in the API: an attempt is worth
-making exactly when its expected reward exceeds its expected cost.
-
 Invariants:
-    E1 — dollars are the only unit. Any layer that introduces a second unit
-    (scores, token counts, probabilities) must convert at its own boundary.
+    E1 — dollars are the only unit for decisions. Scores on ``[0, 1]`` and
+    token counts are converted to dollars (by ``value`` and ``Prices``) before
+    reaching the search.
 
     E2 — an ``AttemptRecord`` is revisable: ``local_score`` is booked at run
     time from the candidate's own post-conditions (or a ``scorer``'s

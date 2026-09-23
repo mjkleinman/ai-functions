@@ -216,19 +216,20 @@ Invariants of the `ai_functions.experimental.economics` module. Same contract as
 above, scoped to the economics layer; each is also stated inline in
 the docstring of the module that enforces it.
 
-## E1 — Dollars are the only unit
+## E1 — Dollars are the only unit for decisions
 
-Rewards, costs, budgets, and reservation prices are all dollars. Any
-layer that introduces a second unit (scores, token counts,
-probabilities) must convert at its own boundary. `value` is the only
-place task success is priced; post-conditions are never a reward
-definition, only the local booking signal (E2 settles them later).
-Violating this reintroduces an implicit exchange rate between layers,
-silently miscalibrating the stopping rule.
+Rewards, costs, budgets, and reservation prices are all dollars; the
+search compares nothing else. Units that live inside a layer (scores on
+`[0, 1]` from beliefs, post-conditions, or a `scorer`; token counts;
+percentages) are converted to dollars before reaching the search: token
+counts by `Prices`, scores by `value`, which is declared once on
+`EconomicFunction` and applied as `value * score` both to estimates
+(`RewardDistribution`) and to each attempt's realized score before the
+search sees it.
 
-Classes that must agree: `Prices`, every `Beliefs` implementation,
-`Estimate` and every `RewardDistribution`, `Search` and every
-`Policy`, and `EconomicFunction` (which owns `value`).
+Classes that must agree: `Prices`, every `Beliefs` implementation (cost
+in dollars, score not), `RewardDistribution` and `RewardCostEstimate`,
+`Search` and every `Policy`, and `EconomicFunction` (which owns `value`).
 
 ## E2 — Attempt records are revisable
 
@@ -255,7 +256,7 @@ anywhere in the search core. Violating this breaks
 makes the `DECISION_EVENT` trail unreproducible.
 
 Classes that must agree: `Search`, every `Policy` implementation, and
-every `RewardDistribution.reservation_price` implementation.
+every `ScoreDistribution.reservation_index` implementation.
 
 ## E4 — Estimates are total
 

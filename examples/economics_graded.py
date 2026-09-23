@@ -35,7 +35,7 @@ from ai_functions.experimental.economics import (
     decisions,
     routed,
 )
-from ai_functions.experimental.economics.search import Categorical, Estimate
+from ai_functions.experimental.economics.search import Categorical, ScoreCostEstimate
 from ai_functions.runtime.usage import subtree_token_usage
 
 VALUE = 0.10  # a perfect report (all planted defects, nothing else) is worth 10 cents
@@ -82,54 +82,59 @@ def worth(report: Report) -> float:
     return VALUE * f1_score(report)
 
 
-class CalibratedRewards(Beliefs):
-    """A separate reward distribution and attempt cost per model, from its own calibration.
+class CalibratedScores(Beliefs):
+    """A separate score distribution and attempt cost per model, from its own calibration.
 
-    One shared estimator holding, for each model, a histogram of the rewards
-    its calibration attempts earned and the mean dollar cost of one attempt
-    — together, that model's "box" in Pandora terms: what an attempt might
-    pay, and what opening the box costs. Starts empty; the calibration
+    One shared estimator holding, for each model, a histogram of the F1
+    scores its calibration attempts earned and the mean dollar cost of one
+    attempt — together, that model's "box" in Pandora terms: what an attempt
+    might pay, and what opening the box costs. Starts empty; the calibration
     phase fills it via ``observe``. The boxes stay fixed for the whole
     search — ``estimate`` ignores the search's history.
 
     This is a graded counterpart of ``EmpiricalBeliefs``: per-model observed
-    statistics, but keeping the full histogram of rewards rather than a
-    pass rate.
+    statistics, but keeping the full histogram of scores rather than a
+    pass rate. The table stores *scores*, not dollars, so the same
+    calibration would serve a task priced differently — the runner prices it
+    at whatever ``value`` the function declares.
     """
 
     def __init__(self) -> None:
         self._table: dict[str, tuple[Categorical, float]] = {}
 
-    def observe(self, label: str, rewards: list[float], mean_cost: float) -> None:
-        """Record one model's calibration: its graded rewards and mean cost.
+    def observe(self, label: str, scores: list[float], mean_cost: float) -> None:
+        """Record one model's calibration: its graded scores and mean cost.
 
-        The box is the frequency histogram of the rewards — each distinct
-        reward becomes one entry whose probability is how often it was
-        observed: rewards {0.04, 0.06, 0.04, 0.06, 0.06} become
-        {$0.04: 40%, $0.06: 60%}.
+        The box is the frequency histogram of the scores — each distinct
+        score becomes one entry whose probability is how often it was
+        observed: scores {0.4, 0.6, 0.4, 0.6, 0.6} become
+        {0.4: 40%, 0.6: 60%}.
         """
-        counts = Counter(rewards)
+        counts = Counter(scores)
         values = tuple(sorted(counts))
-        probs = tuple(counts[v] / len(rewards) for v in values)
-        self._table[label] = (Categorical(values=values, probs=probs), mean_cost)
+        probs = tuple(counts[v] / len(scores) for v in values)
+        self._table[label] = (Categorical(scores=values, probs=probs), mean_cost)
 
     def box(self, label: str) -> str:
-        """Display one model's box: each reward with its probability, and the cost per attempt."""
+        """Display one model's box: each score with its probability, and the cost per attempt."""
         dist, cost = self._table[label]
-        entries = ", ".join(f"${v:.4f}: {p:.0%}" for v, p in zip(dist.values, dist.probs, strict=True))
+        entries = ", ".join(f"F1 {s:.0%}: {p:.0%}" for s, p in zip(dist.scores, dist.probs, strict=True))
         return f"{{{entries}}} at ${cost:.4f}/attempt"
 
     async def estimate(
-        self, task: TaskView, candidates: list[Candidate], value: float | None, history: list[AttemptRecord]
-    ) -> dict[str, Estimate]:
-        del task, value, history
+        self, task: TaskView, candidates: list[Candidate], history: list[AttemptRecord]
+    ) -> dict[str, ScoreCostEstimate]:
+        del task, history
         missing = [c.label for c in candidates if c.label not in self._table]
         if missing:
             raise RuntimeError(f"models not calibrated yet: {missing}")
-        return {c.label: Estimate(dist=self._table[c.label][0], cost=self._table[c.label][1]) for c in candidates}
+        return {
+            c.label: ScoreCostEstimate(score_dist=self._table[c.label][0], cost=self._table[c.label][1])
+            for c in candidates
+        }
 
 
-BOXES = CalibratedRewards()  # empty until phase 1 runs
+BOXES = CalibratedScores()  # empty until phase 1 runs
 
 
 # Graded best-of-N with adaptive ordering and stopping: each attempt is scored
@@ -157,20 +162,20 @@ def review(source: str):
 
 
 async def calibrate(candidate: Candidate) -> tuple[list[float], float]:
-    """Try one model directly a few times; return (graded rewards, mean cost).
+    """Try one model directly a few times; return (graded scores, mean cost).
 
     ``review.candidates`` carries each model's plain function (model already
     swapped in) and its prices, so calibration needs nothing the decorator
     doesn't already have.
     """
-    rewards: list[float] = []
+    scores: list[float] = []
     costs: list[float] = []
     for _ in range(CALIBRATION_TRIALS):
         run = await candidate.fn.trace(source=BUGGY_C)
-        rewards.append(worth(run.value))
+        scores.append(f1_score(run.value))
         usage = await subtree_token_usage(run.coordinator, run.thread_id)
         costs.append(candidate.prices.cost_of(usage))
-    return rewards, sum(costs) / len(costs)
+    return scores, sum(costs) / len(costs)
 
 
 async def main():
@@ -180,10 +185,10 @@ async def main():
 
     lines = []
     for label, candidate in review.candidates.items():
-        rewards, mean_cost = await calibrate(candidate)
-        BOXES.observe(label, rewards, mean_cost)
-        graded = "  ".join(f"${w:.4f}" for w in rewards)
-        lines.append(f"{label:<8} rewards: {graded}   mean cost ${mean_cost:.4f}")
+        scores, mean_cost = await calibrate(candidate)
+        BOXES.observe(label, scores, mean_cost)
+        graded = "  ".join(f"{v:.0%}" for v in scores)
+        lines.append(f"{label:<8} F1: {graded}   mean cost ${mean_cost:.4f}")
     display("Calibration", "\n".join(lines), lang="text")
 
     rule("Phase 2 — search: keep-best reward, Weitzman indices based on calibration data")

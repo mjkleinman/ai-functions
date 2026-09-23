@@ -7,7 +7,7 @@ import math
 import pytest
 
 from ai_functions import ai_function
-from ai_functions.ai_thread import AIFunctionError, PostConditionResult
+from ai_functions.ai_thread import PostConditionResult
 from ai_functions.experimental.economics import (
     Abstained,
     AttemptRecord,
@@ -29,13 +29,15 @@ from ai_functions.experimental.economics import (
 from ai_functions.experimental.economics.search import (
     Bernoulli,
     Categorical,
-    Estimate,
-    Exhaustive,
-    Gaussian,
+    Cheapest,
     Greedy,
     ReservationPricePolicy,
+    RewardCostEstimate,
     RewardDistribution,
+    ScoreCostEstimate,
+    ScoreDistribution,
     Search,
+    bisect_reservation_index,
 )
 from ai_functions.testing import RuntimeHarness, ScriptedModel, Turn
 
@@ -54,45 +56,139 @@ def _task(prompt: str = "p", **args: object) -> TaskView:
 # ══════════════════════════════════════════════════════════════════
 
 
-class TestReservationPrice:
-    @pytest.mark.parametrize("p", [0.05, 0.5, 0.95])
-    @pytest.mark.parametrize("cost", [0.001, 0.01, 0.05])
+class TestReservationIndex:
+    """The score layer: dimensionless, no dollars anywhere."""
+
+    @pytest.mark.parametrize("p", [0.0, 0.05, 0.5, 0.95, 1.0])
+    @pytest.mark.parametrize("cost", [0.001, 0.05, 0.5, 2.0])
     def test_bernoulli_closed_form_matches_bisection(self, p, cost):
-        b = Bernoulli(p=p, value=1.0)
-        closed = b.reservation_price(cost)
-        bisected = RewardDistribution.reservation_price(b, cost)
-        assert abs(closed - bisected) < 1e-6
+        """Closed form vs generic solver; ``cost`` straddles ``p`` to hit both branches."""
+        b = Bernoulli(p=p)
+        assert b.reservation_index(cost) == pytest.approx(bisect_reservation_index(b, cost), abs=1e-6)
 
-    @pytest.mark.parametrize("mu", [0.05, 0.5])
-    @pytest.mark.parametrize("sigma", [0.01, 0.1])
-    @pytest.mark.parametrize("cost", [0.001, 0.01])
-    def test_gaussian_self_consistency(self, mu, sigma, cost):
-        """E[(R - g)_+] = cost must hold at the returned g."""
-        g = Gaussian(mu=mu, sigma=sigma)
-        gg = g.reservation_price(cost)
-        assert abs(g.expected_improvement(gg) - cost) < 1e-5
+    def test_bernoulli_closed_form_is_exact(self):
+        """Where bisection only converges, the closed form lands exactly."""
+        assert Bernoulli(p=0.5).reservation_index(0.1) == 0.8  # 1 - 0.1/0.5
+        assert Bernoulli(p=0.5).reservation_index(0.5) == 0.0  # branches meet at cost == p
+        assert Bernoulli(p=0.05).reservation_index(0.5) == pytest.approx(-0.45)  # p - cost
+        assert Bernoulli(p=0.0).reservation_index(0.5) == pytest.approx(-0.5)  # degenerate p
 
-    def test_zero_cost_is_infinite(self):
-        assert Bernoulli(p=0.5, value=1.0).reservation_price(0.0) == math.inf
-        assert Gaussian(mu=0.5, sigma=0.1).reservation_price(0.0) == math.inf
+    def test_negative_branch_is_exact_for_any_distribution(self):
+        """``cost >= E[S]`` gives exactly ``E[S] - cost`` for any distribution on ``[0, 1]``."""
+        for dist in (
+            Bernoulli(p=0.6),
+            Bernoulli(p=0.0),
+            Categorical(scores=(0.0, 0.5, 1.0), probs=(0.2, 0.5, 0.3)),
+        ):
+            mean = dist.mean()
+            for cost in (mean, mean + 0.25, 5.0):
+                if cost <= 0:
+                    # A free attempt is always worth making, whatever the mean:
+                    # that guard precedes the negative branch.
+                    assert dist.reservation_index(cost) == math.inf
+                    continue
+                assert dist.reservation_index(cost) == pytest.approx(mean - cost), f"{dist!r} at {cost}"
+
+    def test_index_never_exceeds_one(self):
+        # The index is at most 1 for any positive cost, even with all mass at 1.
+        for dist in (Bernoulli(p=1.0), Categorical(scores=(0.0, 1.0), probs=(0.01, 0.99))):
+            for cost in (1e-9, 1e-4, 0.5):
+                assert dist.reservation_index(cost) <= 1.0
+
+    @pytest.mark.parametrize("cost", [0.01, 0.1, 0.2])
+    def test_categorical_self_consistency(self, cost):
+        """E[(S - k)_+] = cost must hold at the returned index (generic bisection)."""
+        cat = Categorical(scores=(0.0, 0.5, 1.0), probs=(0.2, 0.5, 0.3))
+        s = cat.reservation_index(cost)
+        assert abs(cat.expected_improvement(s) - cost) < 1e-5
+
+    def test_free_attempt_index_is_infinite(self):
+        assert Bernoulli(p=0.5).reservation_index(0.0) == math.inf
+        assert Categorical(scores=(0.0, 1.0), probs=(0.5, 0.5)).reservation_index(0.0) == math.inf
 
     def test_categorical_mean_and_improvement(self):
-        cat = Categorical(values=(0.0, 1.0), probs=(0.25, 0.75))
+        cat = Categorical(scores=(0.0, 1.0), probs=(0.25, 0.75))
         assert cat.mean() == pytest.approx(0.75)
-        # E[(R - 0)_+] = 0.75 * 1.0
+        # E[(S - 0)_+] = 0.75 * 1.0
         assert cat.expected_improvement(0.0) == pytest.approx(0.75)
-
-    def test_estimate_net_value(self):
-        e = Estimate(dist=Bernoulli(p=0.4, value=0.10), cost=0.01)
-        assert e.net_value() == pytest.approx(0.4 * 0.10 - 0.01)
 
     def test_bernoulli_rejects_bad_p(self):
         with pytest.raises(ValueError, match="p must be"):
-            Bernoulli(p=1.5, value=1.0)
+            Bernoulli(p=1.5)
 
-    def test_estimate_rejects_negative_cost(self):
+    @pytest.mark.parametrize("scores", [(-0.05, 0.5), (0.5, 1.5)])
+    def test_categorical_rejects_scores_outside_unit_range(self, scores):
+        # Scores must be in [0, 1]; Categorical's own constructor check, before check_score_support.
+        with pytest.raises(ValueError, match=r"scores must be in \[0, 1\]"):
+            Categorical(scores=scores, probs=(0.5, 0.5))
+
+
+class TestReservationPrice:
+    """The dollar layer: ``RewardDistribution`` prices a score distribution."""
+
+    def test_price_is_the_index_scaled_by_value(self):
+        # Pricing must reproduce the familiar g = value - cost / p.
+        value, cost, p = 0.10, 0.002, 0.6
+        d = RewardDistribution(score_dist=Bernoulli(p=p), value=value)
+        assert d.reservation_price(cost) == pytest.approx(value - cost / p)
+        assert d.reservation_price(cost) == pytest.approx(value * Bernoulli(p=p).reservation_index(cost / value))
+
+    def test_price_is_homogeneous_in_money(self):
+        # E[(vS - g)_+] = c and E[(2vS - 2g)_+] = 2c are the same equation, so
+        # doubling value and cost together must double the price exactly.
+        score_dist = Categorical(scores=(0.0, 0.4, 1.0), probs=(0.3, 0.4, 0.3))
+        base = RewardDistribution(score_dist=score_dist, value=0.10).reservation_price(0.002)
+        doubled = RewardDistribution(score_dist=score_dist, value=0.20).reservation_price(0.004)
+        assert doubled == pytest.approx(2 * base, rel=1e-6)
+
+    def test_mean_and_improvement_are_dollars(self):
+        d = RewardDistribution(score_dist=Bernoulli(p=0.4), value=0.10)
+        assert d.mean() == pytest.approx(0.4 * 0.10)
+        assert d.expected_improvement(0.0) == pytest.approx(0.4 * 0.10)
+
+    def test_zero_cost_is_infinite(self):
+        assert RewardDistribution(score_dist=Bernoulli(p=0.5), value=1.0).reservation_price(0.0) == math.inf
+
+    def test_rejects_non_positive_value(self):
+        # value must be strictly positive.
+        for value in (0.0, -1.0):
+            with pytest.raises(ValueError, match="value must be positive"):
+                RewardDistribution(score_dist=Bernoulli(p=0.5), value=value)
+
+    def test_rejects_a_score_distribution_with_impossible_support(self):
+        # The net for custom subclasses, which self-validate nothing.
+        class _ShiftedLow(ScoreDistribution):
+            """Mass at -0.1 and 1.0: legal arithmetic, impossible score."""
+
+            def expected_improvement(self, current: float) -> float:
+                return sum(0.5 * (s - current) for s in (-0.1, 1.0) if s > current)
+
+            def mean(self) -> float:
+                return 0.5 * (-0.1) + 0.5 * 1.0
+
+        class _ShiftedHigh(ScoreDistribution):
+            """Mass at 0.0 and 1.5: above the unit range."""
+
+            def expected_improvement(self, current: float) -> float:
+                return sum(0.5 * (s - current) for s in (0.0, 1.5) if s > current)
+
+            def mean(self) -> float:
+                return 0.5 * 1.5
+
+        with pytest.raises(ValueError, match="puts mass below 0"):
+            RewardDistribution(score_dist=_ShiftedLow(), value=0.10)
+        with pytest.raises(ValueError, match="puts mass above 1"):
+            RewardDistribution(score_dist=_ShiftedHigh(), value=0.10)
+
+
+class TestEstimate:
+    def test_net_value_prices_the_score(self):
+        e = RewardCostEstimate(RewardDistribution(Bernoulli(p=0.4), 0.10), 0.01)
+        assert e.net_value() == pytest.approx(0.4 * 0.10 - 0.01)
+
+    def test_rejects_negative_cost(self):
         with pytest.raises(ValueError, match="cost must be"):
-            Estimate(dist=Bernoulli(p=0.5, value=1.0), cost=-0.01)
+            ScoreCostEstimate(Bernoulli(p=0.5), cost=-0.01)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -103,8 +199,8 @@ class TestReservationPrice:
 class TestSearch:
     def _estimates(self):
         return {
-            "cheap": Estimate(Bernoulli(0.6, 0.10), 0.002),
-            "strong": Estimate(Bernoulli(0.95, 0.10), 0.02),
+            "cheap": RewardCostEstimate(RewardDistribution(Bernoulli(0.6), 0.10), 0.002),
+            "strong": RewardCostEstimate(RewardDistribution(Bernoulli(0.95), 0.10), 0.02),
         }
 
     def test_escalation_order_and_stop(self):
@@ -118,7 +214,7 @@ class TestSearch:
         assert s.spent == pytest.approx(0.022)
 
     def test_max_tries_exhausts_labels(self):
-        s = Search({"only": Estimate(Bernoulli(0.5, 1.0), 0.01)}, budget=1.0, max_tries=1)
+        s = Search({"only": RewardCostEstimate(RewardDistribution(Bernoulli(0.5), 1.0), 0.01)}, budget=1.0, max_tries=1)
         assert s.next() == "only"
         s.observe("only", reward=0.0, cost=0.01)
         assert s.next() is None  # single try used up
@@ -130,31 +226,60 @@ class TestSearch:
         s.observe("cheap", reward=0.0, cost=0.002)
         assert s.next() is None  # strong unaffordable, cheap exhausted
 
-    def test_default_policy_is_greedy(self):
+    def test_default_policy_is_reservation_price(self):
         # cheap has the higher reservation price, strong the higher net value:
-        # the default (Greedy) must pick strong and stop after one reward,
-        # unlike ReservationPricePolicy, which would pick cheap.
-        s = Search(self._estimates())
-        assert s.next() == "strong"
-        s.observe("strong", reward=0.10, cost=0.02)
-        assert s.next() is None
+        # the default is Weitzman's rule, so it must pick cheap; Greedy would
+        # pick strong.
+        est = self._estimates()
+        assert est["cheap"].reservation_price() > est["strong"].reservation_price()
+        assert est["strong"].net_value() > est["cheap"].net_value()
+        s = Search(est)
+        assert s.next() == "cheap"
 
-    def test_greedy_one_shot(self):
+    def test_default_matches_the_function_layer(self):
+        # Search, EconomicFunction and @routed share one default: ReservationPricePolicy.
+        assert isinstance(Search(self._estimates())._policy, ReservationPricePolicy)
+        fn = EconomicFunction({"c": Candidate("c", _dummy_fn(), CHEAP_PRICES)}, value=0.10, beliefs=EmpiricalBeliefs())
+        assert isinstance(fn._policy, ReservationPricePolicy)
+        assert isinstance(
+            routed(models=[PricedModel("m", CHEAP_PRICES, label="c")], value=0.10)(_dummy_fn())._policy,
+            ReservationPricePolicy,
+        )
+
+    def test_greedy_stops_on_any_success(self):
         s = Search(self._estimates(), policy=Greedy())
         assert s.next() == "strong"  # highest net value
         s.observe("strong", reward=0.10, cost=0.02)
-        assert s.next() is None
+        assert s.next() is None  # best > 0
 
-    def test_exhaustive_cheapest_first_no_stop(self):
-        s = Search(self._estimates(), policy=Exhaustive(), budget=1.0, max_tries=1)
-        assert s.next() == "cheap"
-        s.observe("cheap", reward=0.10, cost=0.002)  # even a pass does not stop it
+    def test_greedy_tries_next_best_on_failure(self):
+        # Greedy stops once a positive reward is in hand. When "strong" fails
+        # and reaches max_tries, the search moves on to the next-best candidate.
+        s = Search(self._estimates(), policy=Greedy())
         assert s.next() == "strong"
+        s.observe("strong", reward=0.0, cost=0.02)
+        assert s.next() == "cheap"  # a second candidate, despite Greedy being myopic
+        s.observe("cheap", reward=0.0, cost=0.002)
+        assert s.next() is None  # both labels exhausted
+        assert s.spent == pytest.approx(0.022)
+
+    def test_cheapest_escalates_on_failure(self):
+        s = Search(self._estimates(), policy=Cheapest(), budget=1.0, max_tries=1)
+        assert s.next() == "cheap"
+        s.observe("cheap", reward=0.0, cost=0.002)
+        assert s.next() == "strong"
+
+    def test_cheapest_stops_on_success(self):
+        # Cheapest tries the lowest-cost candidate first and stops at the first positive reward.
+        s = Search(self._estimates(), policy=Cheapest(), budget=1.0, max_tries=1)
+        assert s.next() == "cheap"
+        s.observe("cheap", reward=0.10, cost=0.002)
+        assert s.next() is None
 
     def test_update_estimates_rejects_unknown_label(self):
         s = Search(self._estimates())
         with pytest.raises(KeyError):
-            s.update_estimates({"nope": Estimate(Bernoulli(0.5, 1.0), 0.01)})
+            s.update_estimates({"nope": RewardCostEstimate(RewardDistribution(Bernoulli(0.5), 1.0), 0.01)})
 
     def test_explain_ranked(self):
         s = Search(self._estimates())
@@ -193,8 +318,8 @@ class TestEmpiricalBeliefs:
     async def test_prior_then_learns(self):
         b = EmpiricalBeliefs()
         cands = self._candidates()
-        est0 = await b.estimate(_task(), cands, value=0.10, history=[])
-        assert est0["cheap"].dist.mean() == pytest.approx(0.05)  # 1/(1+1) * 0.10
+        est0 = await b.estimate(_task(), cands, history=[])
+        assert est0["cheap"].score_dist.mean() == pytest.approx(0.5)  # 1/(1+1)
 
         b.update(
             AttemptRecord(id=RecordId("r1"), task=_task(), candidate="cheap", cost=0.002, reward=0.0, local_score=0.0)
@@ -202,20 +327,22 @@ class TestEmpiricalBeliefs:
         b.update(
             AttemptRecord(id=RecordId("r2"), task=_task(), candidate="cheap", cost=0.002, reward=0.10, local_score=1.0)
         )
-        est1 = await b.estimate(_task(), cands, value=0.10, history=[])
+        est1 = await b.estimate(_task(), cands, history=[])
         # alpha=1+1, beta=1+1 -> p=0.5
-        assert est1["cheap"].dist.mean() == pytest.approx(0.05)
+        assert est1["cheap"].score_dist.mean() == pytest.approx(0.5)
         # cost now reflects observed mean, not the token prior
         assert est1["cheap"].cost == pytest.approx(0.002)
 
     @pytest.mark.asyncio
-    async def test_rejects_missing_value_scale(self):
-        # Under merge no constant value scale exists (estimate receives None);
-        # a pass-rate provider must refuse loudly rather than price at a
-        # fictitious scale and silently abstain.
+    async def test_estimates_are_independent_of_value(self):
+        # A provider never sees ``value``, so one estimate serves any price —
+        # and pricing scales it linearly.
         b = EmpiricalBeliefs()
-        with pytest.raises(AIFunctionError, match="constant value scale"):
-            await b.estimate(_task(), self._candidates(), value=None, history=[])
+        est = (await b.estimate(_task(), self._candidates(), history=[]))["cheap"]
+        cheap = RewardDistribution(est.score_dist, 0.10)
+        dear = RewardDistribution(est.score_dist, 50.0)
+        assert cheap.score_dist == dear.score_dist
+        assert dear.mean() == pytest.approx(500 * cheap.mean())
 
     @pytest.mark.asyncio
     async def test_settlement_revises_exactly(self):
@@ -228,21 +355,21 @@ class TestEmpiricalBeliefs:
         b.settle(RecordId("r1"), 0.0)  # downstream says it was useless
         assert "0% pass" in b.stats()["cheap"]  # settlement replaces the verdict
         # The routing estimate smooths with the prior: alpha=1+0, beta=1+1 -> p=1/3
-        est = await b.estimate(_task(), self._candidates(), value=1.0, history=[])
-        assert est["cheap"].dist.mean() == pytest.approx(1 / 3)
+        est = await b.estimate(_task(), self._candidates(), history=[])
+        assert est["cheap"].score_dist.mean() == pytest.approx(1 / 3)
 
     @pytest.mark.asyncio
     async def test_fixed_beliefs_constant(self):
-        b = Beliefs.fixed({"cheap": Estimate(Bernoulli(0.7, 0.10), 0.001)})
+        b = Beliefs.fixed({"cheap": ScoreCostEstimate(Bernoulli(0.7), 0.001)})
         cand = [Candidate("cheap", _dummy_fn(), CHEAP_PRICES)]
-        est = await b.estimate(_task(), cand, value=0.10, history=[])
-        assert est["cheap"].dist.mean() == pytest.approx(0.07)
+        est = await b.estimate(_task(), cand, history=[])
+        assert est["cheap"].score_dist.mean() == pytest.approx(0.7)
 
     @pytest.mark.asyncio
     async def test_fixed_beliefs_missing_label_raises(self):
-        b = Beliefs.fixed({"cheap": Estimate(Bernoulli(0.7, 0.10), 0.001)})
+        b = Beliefs.fixed({"cheap": ScoreCostEstimate(Bernoulli(0.7), 0.001)})
         with pytest.raises(KeyError):
-            await b.estimate(_task(), self._candidates(), value=0.10, history=[])
+            await b.estimate(_task(), self._candidates(), history=[])
 
     def test_decay_rejects_out_of_range(self):
         with pytest.raises(ValueError, match="decay"):
@@ -383,8 +510,8 @@ def _solve(task: str) -> str:
 def _fixed_beliefs():
     return Beliefs.fixed(
         {
-            "cheap": Estimate(Bernoulli(0.6, 0.10), 0.00001),
-            "strong": Estimate(Bernoulli(0.95, 0.10), 0.0002),
+            "cheap": ScoreCostEstimate(Bernoulli(0.6), 0.00001),
+            "strong": ScoreCostEstimate(Bernoulli(0.95), 0.0002),
         }
     )
 
@@ -478,7 +605,7 @@ class TestEndToEnd:
             cheap = ScriptedModel([])
             cands = {"cheap": Candidate("cheap", _solve.replace(model=cheap), Prices(input=1.0, output=1.0))}
             # value 0.10 but cost 1.0 -> net value negative -> abstain, never runs
-            beliefs = Beliefs.fixed({"cheap": Estimate(Bernoulli(0.5, 0.10), 1.0)})
+            beliefs = Beliefs.fixed({"cheap": ScoreCostEstimate(Bernoulli(0.5), 1.0)})
             fn = EconomicFunction(cands, value=0.10, beliefs=beliefs, budget=2.0)
             handle = await h.spawn(fn)
             with pytest.raises(Abstained):
@@ -510,15 +637,16 @@ class TestEndToEnd:
                 ]
             )
             cand = {"m": Candidate("m", _draft.replace(model=model), Prices(input=1.0, output=1.0))}
-            # value=$0.10 for a perfect result, so reward = 0.10 * score:
-            # draw 1 banks $0.02, draw 2 banks $0.06. A draw ~ N($0.05, $0.01)
-            # at $0.005 cost has reservation price ~$0.048 — continue while the
-            # best in hand is below it, stop the moment a draw banks more.
+            # reward = 0.10 * score: draw 1 banks $0.02, draw 2 banks $0.06. The fixed
+            # belief {0.2, 0.6} at even odds and cost 0.005 gives reservation price
+            # 0.5 * (0.06 - g) = 0.005 -> g = $0.05: continue after draw 1, stop after draw 2.
             fn = EconomicFunction(
                 cand,
                 value=0.10,
                 scorer=score,
-                beliefs=Beliefs.fixed({"m": Estimate(Gaussian(mu=0.05, sigma=0.01), 0.005)}),
+                beliefs=Beliefs.fixed(
+                    {"m": ScoreCostEstimate(Categorical(scores=(0.2, 0.6), probs=(0.5, 0.5)), 0.005)}
+                ),
                 budget=1.0,
                 policy=ReservationPricePolicy(),
                 max_tries=None,
@@ -571,8 +699,8 @@ class TestEndToEnd:
             }
             beliefs = Beliefs.fixed(
                 {
-                    "cheap": Estimate(Bernoulli(0.5, 0.10), 0.000002),
-                    "strong": Estimate(Bernoulli(0.99, 0.10), 0.01),  # exceeds budget below
+                    "cheap": ScoreCostEstimate(Bernoulli(0.5), 0.000002),
+                    "strong": ScoreCostEstimate(Bernoulli(0.99), 0.01),  # exceeds budget below
                 }
             )
             fn = EconomicFunction(cands, value=0.10, beliefs=beliefs, budget=0.000005)
@@ -611,7 +739,7 @@ class TestEndToEnd:
     @pytest.mark.asyncio
     async def test_plan_declines_when_unprofitable(self):
         cands = {"cheap": Candidate("cheap", _solve, Prices(input=1.0, output=1.0))}
-        beliefs = Beliefs.fixed({"cheap": Estimate(Bernoulli(0.5, 0.10), 1.0)})
+        beliefs = Beliefs.fixed({"cheap": ScoreCostEstimate(Bernoulli(0.5), 1.0)})
         fn = EconomicFunction(cands, value=0.10, beliefs=beliefs, budget=2.0)
         decision = await fn.plan(task="t")
         assert decision.candidate is None
@@ -619,9 +747,10 @@ class TestEndToEnd:
     @pytest.mark.asyncio
     async def test_plan_works_over_any_distribution(self):
         # The routing decision (candidate, ranking, report) needs only
-        # reservation prices, which every RewardDistribution provides.
+        # reservation prices, which every ScoreDistribution supports.
         cands = {"cheap": Candidate("cheap", _solve, Prices(input=1.0, output=1.0))}
-        beliefs = Beliefs.fixed({"cheap": Estimate(Gaussian(mu=0.05, sigma=0.02), 0.002)})
+        score = Categorical(scores=(0.0, 0.5, 1.0), probs=(0.25, 0.5, 0.25))
+        beliefs = Beliefs.fixed({"cheap": ScoreCostEstimate(score, 0.002)})
         fn = EconomicFunction(cands, value=0.10, beliefs=beliefs)
         decision = await fn.plan(task="t")
         assert decision.candidate is not None
@@ -712,8 +841,8 @@ class _RecordingBeliefs(Beliefs):
     def __init__(self) -> None:
         self.settled: list[tuple[str, float]] = []
 
-    async def estimate(self, task, candidates, value, history):  # noqa: ANN001, ARG002
-        return {c.label: Estimate(Bernoulli(0.5, value), 0.001) for c in candidates}
+    async def estimate(self, task, candidates, history):  # noqa: ANN001, ARG002
+        return {c.label: ScoreCostEstimate(Bernoulli(0.5), 0.001) for c in candidates}
 
     def settle(self, record_id, score):  # noqa: ANN001
         self.settled.append((str(record_id), score))
@@ -877,8 +1006,8 @@ class TestGraphIntegration:
             }
             beliefs = Beliefs.fixed(
                 {
-                    "cheap": Estimate(Bernoulli(0.9, 0.10), 0.000001),
-                    "strong": Estimate(Bernoulli(0.99, 0.10), 0.00001),
+                    "cheap": ScoreCostEstimate(Bernoulli(0.9), 0.000001),
+                    "strong": ScoreCostEstimate(Bernoulli(0.99), 0.00001),
                 }
             )
             fn = EconomicFunction(cands, value=0.10, beliefs=beliefs, budget=1.0, policy=ReservationPricePolicy())

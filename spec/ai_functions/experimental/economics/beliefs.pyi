@@ -2,7 +2,7 @@
 
 A :class:`Beliefs` implementation owns three verbs:
 
-- ``estimate`` — produce an :class:`~.search.Estimate` per candidate for one
+- ``estimate`` — produce a :class:`~.search.ScoreCostEstimate` per candidate for one
   task, read by the economic function's :class:`~.search.Search` loop.
 - ``update`` — fold one freshly booked :class:`~.types.AttemptRecord` in,
   online, at run time (the provisional booking).
@@ -20,10 +20,8 @@ memory-parameter optimization: a provider that learns from text
 the backward pass refines feedback against that run's trace and consolidates it
 into the notes' backend like any other parameter.
 
-The dollar worth of success is declared once, on the economic function, and
-passed into ``estimate`` per call — a ``Beliefs`` instance holds no value
-configuration of its own, which is what lets one instance back several
-economic functions with different values.
+A provider models a *score* distribution in ``[0, 1]``; ``value`` is declared
+once on :class:`~.function.EconomicFunction` and applied there (E1).
 
 Invariants:
     E2 — records are revisable: implementations store per-record
@@ -42,7 +40,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from ...memory.frozen import Frozen
-from .search import Estimate
+from .search import ScoreCostEstimate
 from .types import AttemptRecord, RecordId, TaskView
 
 if TYPE_CHECKING:
@@ -103,19 +101,17 @@ class Beliefs(ABC):
         self,
         task: TaskView,
         candidates: list[Candidate],
-        value: float | None,
         history: list[AttemptRecord],
-    ) -> dict[str, Estimate]:
-        """Estimate each candidate's economics for one task.
+    ) -> dict[str, ScoreCostEstimate]:
+        """Estimate each candidate's score distribution and cost for one task.
+
+        The score distribution is on ``[0, 1]`` and the cost is in dollars; the
+        economic function prices the score at its ``value``.
 
         Args:
             task: The task being attempted (prompt and structured arguments).
             candidates: Candidates to estimate, including labels, prices,
                 and descriptions.
-            value: Dollars a fully passing result is worth — the scale for
-                reward distributions under ``@routed``. ``None`` under
-                ``merge``, where the value is a callable and no constant
-                scale exists.
             history: Records already booked for *this* task's search, newest
                 last; non-empty only on re-estimation rounds.
 
@@ -123,8 +119,7 @@ class Beliefs(ABC):
             An estimate per ``Candidate.label``, covering every candidate (E4).
 
         Raises:
-            AIFunctionError: The estimate could not be produced, or requires
-                the constant value scale and ``value`` is ``None``.
+            AIFunctionError: The estimate could not be produced.
         """
         ...
 
@@ -156,10 +151,10 @@ class Beliefs(ABC):
         ...
 
     @classmethod
-    def fixed(cls, estimates: dict[str, Estimate]) -> Beliefs:
+    def fixed(cls, estimates: dict[str, ScoreCostEstimate]) -> Beliefs:
         """Constant estimates, independent of task and history.
 
-        The zero-cost provider for known workloads, tests, and examples.
+        The provider for estimates that are already known.
 
         Args:
             estimates: The estimate returned for each label, every time.
@@ -179,8 +174,8 @@ class EmpiricalBeliefs(Beliefs):
     stored per record id, so settlement replaces a record's effect exactly
     rather than double-counting it (E2). ``estimate`` ignores the task and
     returns each candidate's posterior mean as a :class:`~.search.Bernoulli`
-    at the call's ``value``, priced at the candidate's mean observed cost
-    (or a prior derived from its token prices before any attempt).
+    score, at the candidate's mean observed cost (or a prior derived from its
+    token prices before any attempt).
 
     Args:
         memory: Backend persisting the statistics across processes; ``None``

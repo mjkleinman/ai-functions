@@ -3,8 +3,8 @@
 ``@routed`` turns an ``@ai_function`` into an economic function over several
 models. The one required number is ``value``: what a verified success is
 worth, in dollars. Given that, each call tries the candidate whose *reservation
-index* is highest (here, the cheap model at first), escalates when the verifier
-rejects the answer, and stops when no attempt is worth its cost.
+index* is highest (here, the cheap model at first), switches to the next candidate
+when the verifier rejects the answer, and stops when no attempt is worth its cost.
 
 A batch of 3-SAT instances — mostly easy, one hard (see ``_economics_utils.py``
 for the difficulty knob) — against a straight-to-strong baseline shows the
@@ -85,12 +85,12 @@ async def run_batch(label: str, solver) -> tuple[list[str], float]:
 async def main():
     logging.basicConfig(level=logging.WARNING)
 
-    rule("Routing with escalation vs. straight to sonnet")
+    rule("Routing with fallback vs. straight to sonnet")
 
-    routed_rows, routed_total = await run_batch("routed (haiku → sonnet)", solve)
+    routed_rows, routed_total = await run_batch("routed (haiku, sonnet)", solve)
     baseline_rows, baseline_total = await run_batch("baseline (straight to sonnet)", solve_strong)
 
-    lines = ["routed (haiku → sonnet):", *routed_rows, "", "baseline (straight to sonnet):", *baseline_rows, ""]
+    lines = ["routed (haiku, sonnet):", *routed_rows, "", "baseline (straight to sonnet):", *baseline_rows, ""]
     lines.append(f"routed total    ${routed_total:.4f}")
     lines.append(f"baseline total  ${baseline_total:.4f}")
     saved = (1.0 - routed_total / baseline_total) * 100 if baseline_total else 0.0

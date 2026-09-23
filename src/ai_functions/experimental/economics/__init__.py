@@ -15,7 +15,7 @@ and adds ``plan()``.
 
 The top level exports the decorator path. The pure search core —
 :class:`~ai_functions.experimental.economics.search.Search`,
-:class:`~ai_functions.experimental.economics.search.Estimate`, the reward distributions,
+:class:`~ai_functions.experimental.economics.search.RewardCostEstimate`, the reward distributions,
 and the :class:`~ai_functions.experimental.economics.search.Policy` implementations —
 lives in :mod:`ai_functions.experimental.economics.search` for power users.
 """

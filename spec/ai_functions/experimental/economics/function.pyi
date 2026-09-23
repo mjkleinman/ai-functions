@@ -1,8 +1,7 @@
 """EconomicFunction: an AI function with candidates, a value, and a budget.
 
-The class both decorators (:func:`~.decorators.routed`,
-:func:`~.decorators.economic`) construct. It owns the standing configuration
-— candidates, beliefs, value, budget, policy — and mirrors the calling
+The class :func:`~.decorators.routed` constructs. It owns the standing
+configuration — candidates, beliefs, value, budget, policy — and mirrors the calling
 surface of ``AIFunction``: ``await fn(...)``, ``run_sync``, ``trace``,
 ``spawn``, plus ``plan()`` — decide without executing. One call runs one
 search: estimate the candidates, loop :class:`~.search.Search`, spawn each
@@ -180,10 +179,9 @@ class EconomicFunction[**P, T](Spawnable[P, T]):
             ``value * score``.
         beliefs: Estimate/learn provider consulted per call.
         budget: Hard dollar cap per call; ``None`` = no cap.
-        policy: Search policy; ``None`` uses the ``Search`` default. The
-            decorator sets ``ReservationPricePolicy`` (Weitzman), which
-            samples while a candidate's reservation price beats the best
-            reward in hand and keeps the best result by score.
+        policy: Search policy; defaults to ``ReservationPricePolicy``
+            (Weitzman), which samples while a candidate's reservation price
+            beats the best reward in hand and keeps the best result by score.
         max_tries: Attempts per candidate per call; ``None`` = unbounded
             (requires ``budget``). The default 1 is Weitzman's classic
             open-each-box-at-most-once; ``None`` is open-ended repeated

@@ -2,7 +2,7 @@
 
 A :class:`Beliefs` implementation owns three verbs:
 
-- ``estimate`` — produce an :class:`~.search.Estimate` per candidate for one
+- ``estimate`` — produce a :class:`~.search.ScoreCostEstimate` per candidate for one
   task, read by the economic function's :class:`~.search.Search` loop.
 - ``update`` — fold one freshly booked :class:`~.types.AttemptRecord` in,
   online, at run time (the provisional booking).
@@ -20,10 +20,8 @@ memory-parameter optimization: a provider that learns from text
 the backward pass refines feedback against that run's trace and consolidates it
 into the notes' backend like any other parameter.
 
-The dollar worth of success is declared once, on the economic function, and
-passed into ``estimate`` per call — a ``Beliefs`` instance holds no value
-configuration of its own, which is what lets one instance back several
-economic functions with different values.
+A provider models a *score* distribution in ``[0, 1]``; ``value`` is declared
+once on :class:`~.function.EconomicFunction` and applied there (E1).
 
 Invariants:
     E2 — records are revisable: implementations store per-record
@@ -44,11 +42,10 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from ai_functions.ai_thread.ai_function import AIFunction, ai_function
-from ai_functions.ai_thread.errors import AIFunctionError
 from ai_functions.memory.frozen import Frozen
 from ai_functions.types import TokenUsage
 
-from .search import Bernoulli, Estimate
+from .search import Bernoulli, ScoreCostEstimate
 from .types import AttemptRecord, RecordId, TaskView
 
 if TYPE_CHECKING:
@@ -65,12 +62,9 @@ _COST_PRIOR_OUTPUT_TOKENS = 500
 
 
 def _check_score(score: float, candidate: str) -> None:
-    """Raise if ``score`` is outside ``[0, 1]`` — the range the Beta posterior needs."""
+    """Raise if ``score`` is outside ``[0, 1]``."""
     if not 0.0 <= score <= 1.0:
-        raise ValueError(
-            f"score must be in [0, 1], got {score} for candidate {candidate!r}; "
-            "return a normalized score (e.g. F1), not a dollar amount"
-        )
+        raise ValueError(f"score must be in [0, 1], got {score} for candidate {candidate!r}")
 
 
 class Beliefs(ABC):
@@ -86,19 +80,17 @@ class Beliefs(ABC):
         self,
         task: TaskView,
         candidates: list[Candidate],
-        value: float | None,
         history: list[AttemptRecord],
-    ) -> dict[str, Estimate]:
-        """Estimate each candidate's economics for one task.
+    ) -> dict[str, ScoreCostEstimate]:
+        """Estimate each candidate's score distribution and cost for one task.
+
+        The score distribution is on ``[0, 1]`` and the cost is in dollars; the
+        economic function prices the score at its ``value``.
 
         Args:
             task: The task being attempted (prompt and structured arguments).
             candidates: Candidates to estimate, including labels, prices,
                 and descriptions.
-            value: Dollars a fully passing result is worth — the scale for
-                reward distributions under ``@routed``. ``None`` under
-                ``merge``, where the value is a callable and no constant
-                scale exists.
             history: Records already booked for *this* task's search, newest
                 last; non-empty only on re-estimation rounds.
 
@@ -106,8 +98,7 @@ class Beliefs(ABC):
             An estimate per ``Candidate.label``, covering every candidate (E4).
 
         Raises:
-            AIFunctionError: The estimate could not be produced, or requires
-                the constant value scale and ``value`` is ``None``.
+            AIFunctionError: The estimate could not be produced.
         """
         ...
 
@@ -139,10 +130,10 @@ class Beliefs(ABC):
         return {}
 
     @classmethod
-    def fixed(cls, estimates: dict[str, Estimate]) -> Beliefs:
+    def fixed(cls, estimates: dict[str, ScoreCostEstimate]) -> Beliefs:
         """Constant estimates, independent of task and history.
 
-        The zero-cost provider for known workloads, tests, and examples.
+        The provider for estimates that are already known.
 
         Args:
             estimates: The estimate returned for each label, every time.
@@ -157,14 +148,14 @@ class Beliefs(ABC):
 class _FixedBeliefs(Beliefs):
     """Constant estimates; learning verbs are no-ops. See :meth:`Beliefs.fixed`."""
 
-    def __init__(self, estimates: dict[str, Estimate]) -> None:
+    def __init__(self, estimates: dict[str, ScoreCostEstimate]) -> None:
         self._estimates = estimates
 
     async def estimate(
-        self, task: TaskView, candidates: list[Candidate], value: float | None, history: list[AttemptRecord]
-    ) -> dict[str, Estimate]:
+        self, task: TaskView, candidates: list[Candidate], history: list[AttemptRecord]
+    ) -> dict[str, ScoreCostEstimate]:
         """Return the fixed estimate for each candidate; every label must be present (E4)."""
-        del task, value, history
+        del task, history
         missing = [c.label for c in candidates if c.label not in self._estimates]
         if missing:
             raise KeyError(f"fixed beliefs have no estimate for {missing}")
@@ -252,8 +243,8 @@ class EmpiricalBeliefs(Beliefs):
     stored per record id, so settlement replaces a record's effect exactly
     rather than double-counting it (E2). ``estimate`` ignores the task and
     returns each candidate's posterior mean as a :class:`~.search.Bernoulli`
-    at the call's ``value``, priced at the candidate's mean observed cost
-    (or a prior derived from its token prices before any attempt).
+    score, at the candidate's mean observed cost (or a prior derived from its
+    token prices before any attempt).
 
     Args:
         memory: Backend persisting the statistics across processes; ``None``
@@ -356,18 +347,11 @@ class EmpiricalBeliefs(Beliefs):
         return alpha, beta, mean_cost
 
     async def estimate(
-        self, task: TaskView, candidates: list[Candidate], value: float | None, history: list[AttemptRecord]
-    ) -> dict[str, Estimate]:
-        """Return each candidate's posterior mean as a Bernoulli at ``value``.
-
-        The Bernoulli value carries the reward scale (``value``); the posterior
-        mean ``p`` is the expected score in ``[0, 1]``, so the expected reward
-        is ``value * p``.
-        """
+        self, task: TaskView, candidates: list[Candidate], history: list[AttemptRecord]
+    ) -> dict[str, ScoreCostEstimate]:
+        """Return each candidate's posterior mean as a ``Bernoulli`` score, at its mean observed cost."""
         del task, history
-        if value is None:
-            raise AIFunctionError("EmpiricalBeliefs requires a constant value scale (dollars a pass is worth)")
-        out: dict[str, Estimate] = {}
+        out: dict[str, ScoreCostEstimate] = {}
         for c in candidates:
             alpha, beta, mean_cost = self._posterior(c.label)
             p = alpha / (alpha + beta)
@@ -376,7 +360,7 @@ class EmpiricalBeliefs(Beliefs):
                 if mean_cost is not None
                 else c.prices.cost_of(TokenUsage(output_tokens=_COST_PRIOR_OUTPUT_TOKENS))
             )
-            out[c.label] = Estimate(dist=Bernoulli(p=p, value=value), cost=cost)
+            out[c.label] = ScoreCostEstimate(score_dist=Bernoulli(p=p), cost=cost)
         return out
 
     def _turn_stats(self, label: str) -> tuple[float, float] | None:
@@ -514,17 +498,9 @@ class LLMForecaster(Beliefs):
         self._notes_key = f"{memory_key}/notes" if memory_key else None
 
     async def estimate(
-        self, task: TaskView, candidates: list[Candidate], value: float | None, history: list[AttemptRecord]
-    ) -> dict[str, Estimate]:
-        """Forecast a pass probability per candidate, anchored on base statistics.
-
-        Raises:
-            AIFunctionError: ``value`` is ``None`` — the forecast is a pass
-                probability priced at the constant value scale. Checked before
-                the forecast call so no tokens are spent on an unusable estimate.
-        """
-        if value is None:
-            raise AIFunctionError("LLMForecaster requires a constant value scale (dollars a pass is worth)")
+        self, task: TaskView, candidates: list[Candidate], history: list[AttemptRecord]
+    ) -> dict[str, ScoreCostEstimate]:
+        """Ask the forecasting LLM for a pass probability per candidate, given ``base``'s pass rates and costs."""
         stats = self._base.stats()
         notes = await self._recall_notes()
 
@@ -536,8 +512,8 @@ class LLMForecaster(Beliefs):
         )
 
         prompt_tokens = _approx_tokens(task.prompt)
-        out: dict[str, Estimate] = {}
-        base_estimates = await self._base.estimate(task, candidates, value, history)
+        out: dict[str, ScoreCostEstimate] = {}
+        base_estimates = await self._base.estimate(task, candidates, history)
         for c in candidates:
             forecast_est = result.estimates.get(c.label)
             if forecast_est is None:
@@ -551,7 +527,7 @@ class LLMForecaster(Beliefs):
                 turns=max(forecast_est.turns, 1),
                 output_tokens_per_turn=forecast_est.output_tokens_per_turn,
             )
-            out[c.label] = Estimate(dist=Bernoulli(p=p, value=value), cost=cost)
+            out[c.label] = ScoreCostEstimate(score_dist=Bernoulli(p=p), cost=cost)
         return out
 
     def _forecast_with_check(self, candidates: list[Candidate]) -> AIFunction:

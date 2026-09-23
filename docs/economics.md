@@ -1,11 +1,11 @@
-# Economics-aware Execution
+# Economics-Aware Execution
 
 Post-conditions give an AI Function correctness semantics: a result either passes verification or it does not. The `ai_functions.experimental.economics` module adds the economics: what a result is worth in dollars, what each candidate model's tokens cost, and therefore which model to try, whether to switch after a failure, and when to stop. Everything shares one currency, so one rule governs every attempt: **an attempt is worth making only when it's expected to yield more than it costs**.
 
 This enables:
 
 - **Cost-aware model routing** — to maximize profit across multiple attempts, each call starts with the model whose *reservation index* [(Weitzman, 1979)](https://www.jstor.org/stable/1910412) is the highest, optionally switches models when verification fails, and declines tasks that are not worth attempting at all. Per-model estimates of pass rate and cost (used for computing reservation indices) sharpen with use.
-- **Task-aware routing with an LLM forecaster** — a lightweight AI function reads each task and predicts, per candidate, its chance of success and its cost, so easy tasks route to cheap models and hard tasks route to strong models within the same function. 
+- **Task-aware routing with an LLM forecaster** — a lightweight AI function reads each task and predicts, per candidate, its chance of success and its cost, so different tasks route to appropriate models accordingly. 
 - **Routing that can improve with feedback** — routing decisions plug into the library's [optimization loop](tutorial.md#memory-and-optimization): feedback on a workflow's final output propagates back to the routing decisions that produced it, corrects their statistics, and distills task-routing notes for future calls.
 - **Adaptive stopping for graded tasks** — when results have graded scores (a review that finds four defects beats one that finds two), a `scorer` scores the result in `[0, 1]`, and the search keeps sampling while another attempt is expected to yield more than it costs, keeping the best result.
 
@@ -67,7 +67,7 @@ print(solve.beliefs.stats())
 
 Optional knobs bound and shape the search: `budget` is a hard dollar cap per call (distinct from `value`: `value` drives choices, `budget` bounds spend); `max_tries` (default 1) caps independent attempts per candidate; `scorer` grades partial success ([Tasks with continuous scores](#tasks-with-continuous-scores)); `policy` swaps the ordering-and-stopping rule ([Customizing the search](#customizing-the-search)).
 
-See `examples/economics_escalate.py` for a runnable comparison: SAT instances routed cheap-first vs. straight to the strong model, with the dollar savings printed. `examples/economics_learning.py` shows the beliefs updated over a batch.
+See `examples/economics_basics.py` for a runnable comparison: SAT instances routed via reservation index vs. straight to the strong model, with the dollar savings printed. `examples/economics_learning.py` shows the beliefs updated over a batch.
 
 ## Task-aware routing that learns: `LLMForecaster`
 
@@ -150,31 +150,31 @@ See `examples/economics_graded.py`: two models graded by F1, each calibrated wit
 
 ## Customizing the search
 
-**Policies.** How candidates are ordered and when the search stops is a pluggable `policy=`. `@routed` defaults to `ReservationPricePolicy`, which orders candidates by their *reservation price*, following the [Pandora's Box rule (Weitzman, 1979)](https://www.jstor.org/stable/1910412): it prices in the option to sample again and continues while some candidate's reservation price beats the best reward in hand. This is an adaptive and sequential version of best-of-N sampling, with the index setting both the order and stopping criterion. Pass `policy=Greedy()` for routing that maximizes expected profit per attempt and stop once a positive reward is in hand; `Exhaustive` tries everything the budget allows, cheapest first.
+**Policies.** How candidates are ordered and when the search stops is a pluggable `policy=`. `@routed` defaults to `ReservationPricePolicy`, which orders candidates by their *reservation price*, following the [Pandora's Box rule (Weitzman, 1979)](https://www.jstor.org/stable/1910412): it prices in the option to sample again and continues while some candidate's reservation price beats the best reward in hand. This is an adaptive and sequential version of best-of-N sampling, with the reservation price setting both the order and stopping criterion. In the context of LLMs, [Achille & Soatto (2025)](https://arxiv.org/abs/2510.12066) framed inference-time search as a Pandora's Box decision problem and proposed using a forecaster to guide the search, which was realized in [Zabounidis et al., (2025)](https://arxiv.org/abs/2511.02130).  Pass `policy=Greedy()` for routing that maximizes expected profit per attempt; `Cheapest` tries the lowest-cost candidate first and escalates on failure. Both stop at the first positive reward.
 
 **Custom beliefs.** When you know the feature that governs task difficulty, you can skip learning it: subclass `Beliefs` and compute the estimates directly. `estimate` receives a `TaskView` carrying both the rendered prompt and the structured call `arguments`:
 
 ```python
 from ai_functions.experimental.economics import Beliefs
-from ai_functions.experimental.economics.search import Bernoulli, Estimate
+from ai_functions.experimental.economics.search import Bernoulli, ScoreCostEstimate
 
 
 class RatioBeliefs(Beliefs):
     """3-SAT hardness is governed by the clause/variable ratio; read it
     from the call's own arguments instead of learning it from outcomes."""
 
-    async def estimate(self, task, candidates, value, history):
+    async def estimate(self, task, candidates, history):
         ratio = (task.arguments["clauses"].count("\n") + 1) / task.arguments["n_vars"]
         return {
-            c.label: Estimate(
-                dist=Bernoulli(p=self._pass_probability(c.label, ratio), value=value),
+            c.label: ScoreCostEstimate(
+                score_dist=Bernoulli(p=self._pass_probability(c.label, ratio)),
                 cost=self._expected_cost(c, ratio),
             )
             for c in candidates
         }
 ```
 
-`estimate` must return an estimate for every candidate it is given, and the `value` it receives is the constant `value` (the reward scale), so an estimate's expected reward is `value` times the expected score. For known workloads and tests, `Beliefs.fixed({label: Estimate(...)})` returns constant estimates with no learning. See `examples/economics_route.py` for the complete `RatioBeliefs`.
+`estimate` must return a `ScoreCostEstimate` for every candidate it is given — a `ScoreDistribution` (how well the candidate will do, in `[0, 1]`) plus what one attempt costs. It never sees `value`; the `ScoreDistribution` is scaled by the provided `value` into a `RewardDistribution` in dollars. To provide constant estimates (with no learning), use `Beliefs.fixed({label: ScoreCostEstimate(...)})`. See `examples/economics_route.py` for the complete `RatioBeliefs` example.
 
 **Custom candidates.** When model swaps are not enough, pass `candidates=[Candidate(label=..., fn=..., prices=...)]` instead of `models=`: a candidate is *any* `AIFunction` plus its prices — a different thinking budget, a different prompt, or a non-LLM heuristic wrapped as a function. Build variants with `fn.replace(...)`.
 
@@ -204,7 +204,7 @@ Every attempt runs as a child thread and emits durable events, so `spend` gives 
 
 | Example                 | Shows                                                                                                                       |
 |-------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| `economics_escalate.py` | `@routed` basics: cheap-first escalation on a SAT batch, dollar savings vs. a straight-to-strong baseline                   |
+| `economics_basics.py`   | `@routed` basics: cheap-first escalation on a SAT batch, dollar savings vs. a straight-to-strong baseline                   |
 | `economics_learning.py` | `EmpiricalBeliefs` converging over a batch: exploration from a uniform prior, routing sharpening with evidence              |
 | `economics_graded.py`   | Graded routing with `scorer`: two models graded by F1 with per-arm calibrated beliefs, searched with the Pandora's Box rule |
 | `economics_route.py`    | A custom task-dependent `Beliefs`; `plan()` previews each decision                                                          |

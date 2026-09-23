@@ -1,10 +1,10 @@
 """Pure sequential-search core: reservation prices over labeled estimates.
 
 This layer knows nothing about ``AIFunction``, threads, or money sources —
-it is a decision calculator over ``{label: Estimate}``. The runner layer
-binds labels to executable candidates; tests bind them to closed-form
-optima. Power users import from here; the top-level package exports only
-the decorator path.
+it is a decision calculator over ``{label: RewardCostEstimate}``. The
+:class:`~.function.EconomicFunction` (and the thread it spawns) binds labels to
+executable candidates; tests bind them to closed-form optima. Power users
+import from here; the top-level package exports only the decorator path.
 
 The rule implemented by :class:`Search` under :class:`ReservationPricePolicy`
 is Weitzman's Pandora's box rule, optimal for independent alternatives:
@@ -14,6 +14,9 @@ is Weitzman's Pandora's box rule, optimal for independent alternatives:
   candidate is exactly break-even.
 - Try candidates in descending ``g``; stop as soon as the best remaining
   ``g`` does not exceed the best reward already realized.
+
+``R`` is a priced score: a :class:`ScoreDistribution` on ``[0, 1]`` becomes a
+:class:`RewardDistribution` once multiplied by a ``value``.
 
 Invariants:
     E1 — rewards, costs, budgets, and reservation prices are all dollars.
@@ -30,45 +33,196 @@ from dataclasses import dataclass
 from .types import Ranking
 
 
-# ── Reward distributions ──
+# ── Score distributions ──
 
-def bisect_reservation_price(
-    dist: RewardDistribution,
-    cost: float,
+SUPPORT_TOL: float
+"""Tolerance for the ``[0, 1]`` support check on a score distribution."""
+
+
+def bisect_reservation_index(
+    score_dist: ScoreDistribution,
+    normalized_cost: float,
     *,
-    bound: float = 1e3,
     tol: float = 1e-9,
     max_iter: int = 100,
 ) -> float:
-    """Solve ``E[(R - g)_+] = cost`` for ``g`` by bisection.
+    """Solve ``E[(S - k)_+] = normalized_cost`` for the reservation index ``k``.
 
-    The generic solver behind ``RewardDistribution.reservation_price`` for
-    every distribution without a closed form. ``expected_improvement`` is
-    non-increasing in ``g``, so the root is unique and bisection converges.
+    The generic solver behind ``ScoreDistribution.reservation_index`` for every
+    distribution without a closed form. ``expected_improvement`` is
+    non-increasing in ``k``, so the root is unique. All quantities, including
+    ``normalized_cost``, are in score units.
 
     Args:
-        dist: The reward distribution to solve for.
-        cost: Dollar cost of one attempt.
-        bound: Search bracket ``[-bound, bound]`` in dollars. A root outside
-            the bracket is clipped to the nearest endpoint, so distributions
-            whose rewards approach this scale need a larger bound for an
-            exact price.
-        tol: Convergence tolerance on ``E[(R - g)_+] - cost``, in dollars.
+        score_dist: The score distribution to solve for.
+        normalized_cost: One attempt's cost divided by ``value``, in score units.
+        tol: Convergence tolerance on ``E[(S - k)_+] - normalized_cost``.
         max_iter: Maximum bisection iterations.
 
     Returns:
-        The reservation price ``g`` in dollars, clipped to ``[-bound, bound]``;
-        ``+inf`` when ``cost <= 0`` (a free attempt is always worth making).
+        The reservation index ``k``, in ``(-inf, 1]``; ``+inf`` when
+        ``normalized_cost <= 0`` (a free attempt is always worth making).
     """
     ...
 
 
-class RewardDistribution(ABC):
-    """Estimated distribution of an attempt's dollar reward, before running it."""
+class ScoreDistribution(ABC):
+    """Estimated distribution of an attempt's score, before running it.
+
+    Support is ``[0, 1]``.
+    """
 
     @abstractmethod
     def expected_improvement(self, current: float) -> float:
-        """Return ``E[(R - current)_+]``, the expected gain over a reward in hand.
+        """Return ``E[(S - current)_+]``, the expected gain over a score in hand.
+
+        Args:
+            current: The best score already realized, in ``[0, 1]``.
+
+        Returns:
+            Expected improvement in score units; non-negative and
+            non-increasing in ``current``.
+        """
+        ...
+
+    @abstractmethod
+    def mean(self) -> float:
+        """Return ``E[S]``, in ``[0, 1]``."""
+        ...
+
+    def reservation_index(self, normalized_cost: float) -> float:
+        """Solve ``E[(S - k)_+] = normalized_cost``; see :func:`bisect_reservation_index`.
+
+        Subclasses with a closed form override this (:class:`Bernoulli`).
+
+        Args:
+            normalized_cost: One attempt's cost divided by ``value``, in score units.
+
+        Returns:
+            The reservation index ``k``; ``+inf`` when ``normalized_cost <= 0``.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class Bernoulli(ScoreDistribution):
+    """Two-point score: ``1.0`` with probability ``p``, else ``0.0``.
+
+    Args:
+        p: Probability of success, in ``[0, 1]``.
+
+    Raises:
+        ValueError: ``p`` outside ``[0, 1]``.
+    """
+
+    p: float
+
+    def __post_init__(self) -> None:
+        """Validate the ``p`` range."""
+        ...
+
+    def reservation_index(self, normalized_cost: float) -> float:
+        """Closed form: ``k = 1 - c / p`` when ``c < p``, else ``k = p - c``.
+
+        ``c`` is the normalized cost. The second branch is the ``k <= 0`` case
+        and also covers ``p == 0``.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class Categorical(ScoreDistribution):
+    """Discrete score over ``scores`` with probabilities ``probs``.
+
+    Args:
+        scores: Score outcomes; each must lie in ``[0, 1]``.
+        probs: Probability of each outcome; same length as ``scores``,
+            non-negative, summing to 1.
+
+    Raises:
+        ValueError: Length mismatch, a score outside ``[0, 1]``, a negative
+            probability, or probs sum != 1.
+    """
+
+    scores: tuple[float, ...]
+    probs: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        """Validate lengths, the ``[0, 1]`` score range, and sum-to-one."""
+        ...
+
+
+# ── Score estimate (what beliefs return) ──
+
+@dataclass(frozen=True)
+class ScoreCostEstimate:
+    """What a :class:`~.beliefs.Beliefs` provider returns, before pricing.
+
+    The economic function prices it at its ``value`` to get a
+    :class:`RewardCostEstimate`, the form :class:`Search` consumes (E1).
+
+    Args:
+        score_dist: Estimated distribution of one attempt's score, on
+            ``[0, 1]``.
+        cost: Expected dollar cost of one attempt.
+
+    Raises:
+        ValueError: ``cost`` negative, or ``score_dist`` puts mass outside
+            ``[0, 1]``.
+    """
+
+    score_dist: ScoreDistribution
+    cost: float
+
+    def __post_init__(self) -> None:
+        """Validate ``cost`` and the score support."""
+        ...
+
+
+def check_score_support(score_dist: ScoreDistribution) -> None:
+    """Raise if ``score_dist`` puts mass outside ``[0, 1]``.
+
+    Read off the two methods every score distribution already has, so custom
+    subclasses are covered without support introspection:
+
+    - ``E[(S - 1)_+] == 0`` iff no mass above 1.
+    - ``E[(S - 0)_+] == E[S]`` iff no mass below 0, since the left side is
+      ``E[max(S, 0)]``.
+
+    Raises:
+        ValueError: Mass above 1, or mass below 0.
+    """
+    ...
+
+
+# ── Reward distribution (the dollar boundary) ──
+
+@dataclass(frozen=True)
+class RewardDistribution:
+    """A score distribution priced in dollars: ``R = value * S``.
+
+    The module's unit boundary (E1). Rescaling is exact for a positive
+    ``value``: ``E[(vS - g)_+] == v * E[(S - g/v)_+]``.
+
+    Args:
+        score_dist: Estimated distribution of one attempt's score, on ``[0, 1]``.
+        value: Dollars a fully-successful (score 1.0) result is worth;
+            positive.
+
+    Raises:
+        ValueError: ``value`` non-positive, or ``score_dist`` puts mass outside
+            ``[0, 1]``.
+    """
+
+    score_dist: ScoreDistribution
+    value: float
+
+    def __post_init__(self) -> None:
+        """Validate ``value`` and the score support."""
+        ...
+
+    def expected_improvement(self, current: float) -> float:
+        """Return ``E[(R - current)_+]`` in dollars, the gain over a reward in hand.
 
         Args:
             current: The best reward already realized, in dollars.
@@ -79,116 +233,42 @@ class RewardDistribution(ABC):
         """
         ...
 
-    @abstractmethod
     def mean(self) -> float:
-        """Return ``E[R]`` in dollars."""
+        """Return ``E[R] = value * E[S]``, in dollars."""
         ...
 
     def reservation_price(self, cost: float) -> float:
-        """Solve ``E[(R - g)_+] = cost`` for ``g``; see :func:`bisect_reservation_price`.
+        """Solve ``E[(R - g)_+] = cost`` for ``g``, in dollars.
 
-        Delegates to the generic bisection solver with its default controls.
-        Subclasses with a closed form override this (:class:`Bernoulli`);
-        callers needing non-default solver controls use
-        :func:`bisect_reservation_price` directly or override this method
-        to bake them into the distribution.
+        Normalizes the cost by ``value``, solves in score units via
+        :meth:`~ScoreDistribution.reservation_index`, and scales back.
 
         Args:
-            cost: Dollar cost of one attempt.
+            cost: Expected dollar cost of one attempt.
 
         Returns:
-            The reservation price ``g`` in dollars; ``+inf`` when
-            ``cost <= 0`` (a free attempt is always worth making).
+            The reservation price ``g`` in dollars; ``+inf`` when ``cost <= 0``.
         """
         ...
 
 
-@dataclass(frozen=True)
-class Bernoulli(RewardDistribution):
-    """Two-point reward: ``value`` with probability ``p``, else 0.
-
-    Args:
-        p: Probability of success, in ``[0, 1]``.
-        value: Dollar reward on success.
-
-    Raises:
-        ValueError: ``p`` outside ``[0, 1]`` or ``value`` negative.
-    """
-
-    p: float
-    value: float
-
-    def __post_init__(self) -> None:
-        """Validate ``p`` and ``value`` ranges."""
-        ...
-
-    def reservation_price(self, cost: float) -> float:
-        """Closed form for the two-point reward.
-
-        With ``R in {0, value}`` and ``P(R = value) = p``:
-        ``E[(R - g)_+] = p * (value - g)`` for ``0 <= g <= value``. Solving
-        ``= cost`` gives ``g = value - cost / p``. Outside that band the
-        equation degenerates, so fall back to the generic solver.
-        """
-        ...
-
+# ── RewardCostEstimate ──
 
 @dataclass(frozen=True)
-class Gaussian(RewardDistribution):
-    """Normal reward ``R ~ N(mu, sigma^2)``, in dollars.
-
-    Args:
-        mu: Mean reward.
-        sigma: Standard deviation; must be non-negative.
-
-    Raises:
-        ValueError: ``sigma`` negative.
-    """
-
-    mu: float
-    sigma: float
-
-    def __post_init__(self) -> None:
-        """Validate ``sigma`` is non-negative."""
-        ...
-
-
-@dataclass(frozen=True)
-class Categorical(RewardDistribution):
-    """Discrete reward over ``values`` with probabilities ``probs``.
-
-    Args:
-        values: Dollar outcomes.
-        probs: Probability of each outcome; same length as ``values``,
-            non-negative, summing to 1.
-
-    Raises:
-        ValueError: Length mismatch, negative probability, or sum != 1.
-    """
-
-    values: tuple[float, ...]
-    probs: tuple[float, ...]
-
-    def __post_init__(self) -> None:
-        """Validate lengths, non-negativity, and sum-to-one."""
-        ...
-
-
-# ── Estimate ──
-
-@dataclass(frozen=True)
-class Estimate:
+class RewardCostEstimate:
     """One candidate's estimated economics for one task: reward distribution plus cost.
 
+    A :class:`ScoreCostEstimate` once the economic function has priced it.
+
     Args:
-        dist: Estimated distribution of the dollar reward of one attempt.
+        reward_dist: Estimated distribution of the dollar reward of one attempt.
         cost: Expected dollar cost of one attempt.
 
     Raises:
         ValueError: ``cost`` negative.
     """
 
-    dist: RewardDistribution
+    reward_dist: RewardDistribution
     cost: float
 
     def __post_init__(self) -> None:
@@ -200,9 +280,10 @@ class Estimate:
 
         Returns:
             The reservation price in dollars: ``+inf`` when ``cost == 0``,
-            below ``dist.mean()`` when the cost is high. Uses the Bernoulli
-            closed form when ``dist`` is :class:`Bernoulli`, bisection
-            otherwise.
+            below ``reward_dist.mean()`` when the cost is high. Exact when the
+            underlying score distribution has a closed-form
+            :meth:`~ScoreDistribution.reservation_index`
+            (:class:`Bernoulli`), bisected otherwise.
         """
         ...
 
@@ -223,7 +304,7 @@ class Policy(ABC):
     @abstractmethod
     def next(
         self,
-        estimates: dict[str, Estimate],
+        estimates: dict[str, RewardCostEstimate],
         best: float,
         remaining_budget: float | None,
     ) -> str | None:
@@ -252,11 +333,15 @@ class ReservationPricePolicy(Policy):
 
 
 class Greedy(Policy):
-    """Highest net value above zero, then commit: try at most one candidate."""
+    """Highest net value above zero; stop as soon as anything succeeds.
+
+    Ranks candidates by ``net_value()``, the expected reward of one attempt
+    minus its cost. On failure it tries the next-best candidate.
+    """
 
 
-class Exhaustive(Policy):
-    """Cheapest-first, no early stopping: try every candidate the budget allows."""
+class Cheapest(Policy):
+    """Lowest cost first, escalating on failure until one succeeds."""
 
 
 # ── Search ──
@@ -273,7 +358,8 @@ class Search:
         estimates: Initial estimate per label. Labels are opaque to the search.
         budget: Optional hard cap on total observed cost, in dollars.
         policy: Ordering-and-stopping rule; defaults to
-            :class:`Greedy`.
+            :class:`ReservationPricePolicy`, Weitzman's rule and the optimal
+            one for independent candidates.
         max_tries: Attempts allowed per label; ``None`` = unbounded (the
             policy's stopping rule is the only limit).
 
@@ -283,7 +369,7 @@ class Search:
 
     def __init__(
         self,
-        estimates: dict[str, Estimate],
+        estimates: dict[str, RewardCostEstimate],
         budget: float | None = None,
         policy: Policy | None = None,
         max_tries: int | None = 1,
@@ -307,7 +393,7 @@ class Search:
         ``True`` when a candidate would still be tried on unlimited budget but
         every such candidate's expected cost exceeds the remaining budget —
         i.e. the search is not done on its own terms, it merely ran out of
-        money. Lets the runner distinguish ``BudgetExceeded`` from a genuine
+        money. Lets the economic function distinguish ``BudgetExceeded`` from a genuine
         stop or exhaustion.
         """
         ...
@@ -329,7 +415,7 @@ class Search:
         """
         ...
 
-    def update_estimates(self, estimates: dict[str, Estimate]) -> None:
+    def update_estimates(self, estimates: dict[str, RewardCostEstimate]) -> None:
         """Replace the estimates consulted by subsequent :meth:`next` calls.
 
         Args:

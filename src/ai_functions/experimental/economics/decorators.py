@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from .beliefs import Beliefs, EmpiricalBeliefs
 from .function import EconomicFunction, Scorer
-from .search import Policy, ReservationPricePolicy
+from .search import Policy
 from .types import Candidate, PricedModel
 
 if TYPE_CHECKING:
@@ -115,7 +115,7 @@ def routed[**P, T](
             scorer=scorer,
             beliefs=beliefs if beliefs is not None else EmpiricalBeliefs(),
             budget=budget,
-            policy=policy if policy is not None else ReservationPricePolicy(),
+            policy=policy,
             max_tries=max_tries,
         )
 

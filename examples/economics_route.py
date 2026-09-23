@@ -29,7 +29,7 @@ from ai_functions.experimental.economics import (
     TaskView,
     routed,
 )
-from ai_functions.experimental.economics.search import Bernoulli, Estimate, Greedy
+from ai_functions.experimental.economics.search import Bernoulli, Greedy, ScoreCostEstimate
 
 VALUE = 0.05  # a verified solution is worth 5 cents
 
@@ -47,14 +47,14 @@ class RatioBeliefs(Beliefs):
     """
 
     async def estimate(
-        self, task: TaskView, candidates: list[Candidate], value: float, history: list[AttemptRecord]
-    ) -> dict[str, Estimate]:
+        self, task: TaskView, candidates: list[Candidate], history: list[AttemptRecord]
+    ) -> dict[str, ScoreCostEstimate]:
         ratio = (task.arguments["clauses"].count("\n") + 1) / task.arguments["n_vars"]
-        out: dict[str, Estimate] = {}
+        out: dict[str, ScoreCostEstimate] = {}
         for c in candidates:
             p = 1.0 / (1.0 + math.exp(2.0 * (ratio - SKILL_MIDPOINT[c.label])))
             est_tokens = 300 + 400 * ratio  # harder instances burn more reasoning tokens
-            out[c.label] = Estimate(dist=Bernoulli(p=p, value=value), cost=c.prices.output * est_tokens / 1e6)
+            out[c.label] = ScoreCostEstimate(score_dist=Bernoulli(p=p), cost=c.prices.output * est_tokens / 1e6)
         return out
 
 

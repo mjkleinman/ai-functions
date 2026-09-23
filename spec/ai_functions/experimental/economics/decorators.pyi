@@ -3,11 +3,11 @@
 Stacks on ``@ai_function`` and returns an
 :class:`~.function.EconomicFunction` that is called exactly like the function
 it wraps. It routes each call to the candidate worth running across a set of
-priced models over *independent* attempts, samples independent attempts while
-another is expected to pay for itself, and returns the best result by score —
-declining (:class:`~.types.Abstained`) when no candidate's expected reward
-covers its cost. Attempts are independent; cumulative work that accumulates
-across passes belongs to an agentic orchestrator, not this decorator.
+priced models, samples independent attempts while another is expected to pay
+for itself, and returns the best result by score — declining
+(:class:`~.types.Abstained`) when no candidate's expected reward covers its
+cost. Attempts are independent; cumulative work that accumulates across passes
+belongs to an agentic orchestrator, not this decorator.
 """
 
 from __future__ import annotations
